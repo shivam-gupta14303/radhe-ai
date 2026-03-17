@@ -1,0 +1,55 @@
+# 🔐 Sensitive (NEVER PUSH THESE)
+
+.env
+credentials.json
+token.json
+radhe_memory.json
+
+# 🗄️ Databases
+
+*.db
+*.sqlite3
+
+# 🧠 Python cache
+
+**pycache**/
+*.pyc
+*.pyo
+
+# 📁 Ignore ALL data folders (IMPORTANT)
+
+data/
+**/data/
+whatsapp_profile/
+
+# 📦 Large / model / cache
+
+*.tflite
+*.pb
+*.pb.gz
+*.bin
+*.cache
+Cache/
+Code Cache/
+*.log
+
+# 🖥️ OS files
+
+.DS_Store
+Thumbs.db
+
+# 🧪 Virtual environment
+
+venv/
+.env/
+.env.local
+
+# 🧰 IDE / Editor
+
+.vscode/
+.idea/
+
+# 📤 Temporary / misc
+
+*.tmp
+*.bak
