@@ -1,4 +1,4 @@
-# 🔐 Sensitive (NEVER PUSH THESE)
+# 🔐 Sensitive (NEVER PUSH)
 
 .env
 credentials.json
@@ -10,46 +10,63 @@ radhe_memory.json
 *.db
 *.sqlite3
 
-# 🧠 Python cache
-
-**pycache**/
-*.pyc
-*.pyo
-
-# 📁 Ignore ALL data folders (IMPORTANT)
+# 📁 Data folders
 
 data/
 **/data/
 whatsapp_profile/
 
-# 📦 Large / model / cache
+# 🧠 Python cache
 
-*.tflite
-*.pb
-*.pb.gz
-*.bin
-*.cache
-Cache/
-Code Cache/
+**pycache**/
+*.py[codz]
+*$py.class
+
+# C extensions
+
+*.so
+
+# Distribution / packaging
+
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Installer logs
+
+pip-log.txt
+
+# Unit test / coverage
+
+.coverage
+.pytest_cache/
+.cache
+
+# Logs
+
 *.log
 
-# 🖥️ OS files
+# Virtual environments
 
-.DS_Store
-Thumbs.db
-
-# 🧪 Virtual environment
-
+.venv
 venv/
-.env/
-.env.local
+env/
 
-# 🧰 IDE / Editor
+# IDE / Editor
 
 .vscode/
 .idea/
 
-# 📤 Temporary / misc
+# OS files
 
-*.tmp
-*.bak
+.DS_Store
+Thumbs.db
+
+# Models / large files
+
+*.tflite
+*.pb
+*.bin
+*.cache
