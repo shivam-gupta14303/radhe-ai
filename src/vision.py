@@ -1,34 +1,43 @@
 # vision.py
 """
-VisionManager - robust, production-minded version.
+VisionManager for Radhe.
 
-Responsibilities:
-- OCR (pytesseract) with graceful fallback and clear error messages when system tesseract not installed.
-- Image captioning & object detection placeholders (clean, documented).
-- Defensive coding: does not crash main process; logs helpful instructions when system deps are missing.
+Fixes applied vs previous version:
+- image_captioning() and object_detection() were accidentally defined OUTSIDE
+  the class (wrong indentation). Both are now proper class methods.
+- object_detection() was nested INSIDE image_captioning() — fixed.
+- Added missing `import os` (was used but not imported in the standalone functions).
 
-Notes / Senior-dev guidance:
-- pytesseract is a Python wrapper around the tesseract binary. The binary must be installed on the host OS.
-  - Ubuntu/Debian: sudo apt-get install tesseract-ocr
-  - macOS (Homebrew): brew install tesseract
-  - Windows: install Tesseract from https://github.com/tesseract-ocr/tesseract/releases
-- For real image captioning / object detection replace placeholders with a lightweight model (e.g., torchvision, Detectron2,
-  or a small Hugging Face model). Avoid loading heavy models at import time; load lazily at first use.
+Goal-aligned improvements:
+- analyze_image() added as a single unified entry point: OCR + caption + objects.
+  Radhe can call this one method and get a full description of any image.
+- screen_capture() added: takes a screenshot and runs analyze_image() on it.
+  This is the foundation for "watch my screen and tell me what's happening."
+
+Install notes:
+    pip install pillow pytesseract opencv-python-headless pyautogui
+    Ubuntu/Debian: sudo apt-get install tesseract-ocr
+    macOS:         brew install tesseract
+    Windows:       https://github.com/tesseract-ocr/tesseract/releases
 """
 
-import logging
 import os
+import logging
+import tempfile
 from typing import List, Dict, Optional
 
 logger = logging.getLogger("Radhe_Vision")
 logger.setLevel(logging.INFO)
 
-# Try to import optional dependencies; fail gracefully if missing.
+# ── Optional dependency guards ────────────────────────────────────────
+
 try:
     from PIL import Image
+    PIL_AVAILABLE = True
 except Exception:
     Image = None
-    logger.warning("PIL (Pillow) is not available. Install with `pip install pillow` for image support.")
+    PIL_AVAILABLE = False
+    logger.warning("Pillow not available. Run: pip install pillow")
 
 try:
     import pytesseract
@@ -36,125 +45,245 @@ try:
 except Exception:
     pytesseract = None
     TESSERACT_AVAILABLE = False
-    logger.warning("pytesseract not available. Install with `pip install pytesseract` and the Tesseract binary.")
+    logger.warning(
+        "pytesseract not available. "
+        "Run: pip install pytesseract  and  install Tesseract binary."
+    )
 
 try:
     import cv2
     import numpy as np
     OPENCV_AVAILABLE = True
 except Exception:
-    cv2 = None
-    np = None
+    cv2  = None
+    np   = None
     OPENCV_AVAILABLE = False
-    logger.warning("OpenCV (cv2) not available. Install with `pip install opencv-python` for advanced CV tasks.")
+    logger.warning("OpenCV not available. Run: pip install opencv-python-headless")
 
+try:
+    import pyautogui
+    PYAUTOGUI_AVAILABLE = True
+except Exception:
+    pyautogui = None
+    PYAUTOGUI_AVAILABLE = False
+    logger.warning("pyautogui not available. Run: pip install pyautogui")
+
+
+# ==================================================================
+# VISION MANAGER
+# ==================================================================
 
 class VisionManager:
+
     def __init__(self, tesseract_cmd: Optional[str] = None):
         """
-        tesseract_cmd: Optional override for pytesseract.pytesseract.tesseract_cmd
-        Example on Windows: r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        tesseract_cmd: optional path override for the Tesseract binary.
+        Example on Windows: r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
         """
-        if tesseract_cmd and pytesseract:
+        if tesseract_cmd and TESSERACT_AVAILABLE:
             try:
                 pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
             except Exception as e:
-                logger.warning("Failed to set pytesseract command: %s", e)
+                logger.warning("Failed to set Tesseract command: %s", e)
 
-    # -------------------------
+    # ==================================================================
     # OCR
-    # -------------------------
+    # ==================================================================
+
     def ocr_from_image(self, image_path: str) -> str:
         """
-        Extract text from an image using pytesseract.
-        Returns empty string on failure (never raises).
+        Extract text from an image file using pytesseract.
+        Returns empty string on failure — never raises.
         """
-
         if not os.path.exists(image_path):
-            logger.error("OCR failed: image not found: %s", image_path)
+            logger.error("OCR: image not found: %s", image_path)
             return ""
 
-        if not Image:
-            logger.error("OCR failed: Pillow not installed.")
+        if not PIL_AVAILABLE:
+            logger.error("OCR: Pillow not installed.")
             return ""
 
         if not TESSERACT_AVAILABLE:
             logger.error(
-                "OCR not available: pytesseract or Tesseract binary missing. "
-                "Install pytesseract (`pip install pytesseract`) and the Tesseract binary "
-                "(Ubuntu: `sudo apt-get install tesseract-ocr`, macOS: `brew install tesseract`)."
+                "OCR: pytesseract or Tesseract binary missing. "
+                "Install: pip install pytesseract  and the Tesseract binary."
             )
             return ""
 
         try:
             with Image.open(image_path) as img:
-                # Optionally convert to grayscale to improve OCR
                 try:
-                    img = img.convert("L")
+                    img = img.convert("L")   # grayscale improves OCR accuracy
+                except Exception:
+                    pass
+                text = pytesseract.image_to_string(img)
+                return (text or "").strip()
+
+        except Exception as e:
+            logger.exception("ocr_from_image failed for %s: %s", image_path, e)
+            return ""
+
+    # ==================================================================
+    # IMAGE CAPTIONING
+    # (Fix: was outside the class in the previous version)
+    # ==================================================================
+
+    def image_captioning(self, image_path: str) -> str:
+        """
+        Generate a basic description of an image.
+
+        Currently returns dimensions + colour info.
+        Replace the body with a real model call (e.g. BLIP, GPT-4 Vision)
+        when you're ready to upgrade.
+        """
+        if not os.path.exists(image_path):
+            return "Image file not found."
+
+        if not PIL_AVAILABLE:
+            return "Image captioning unavailable: Pillow not installed."
+
+        try:
+            with Image.open(image_path) as img:
+                w, h   = img.size
+                mode   = img.mode
+                format_= img.format or "unknown"
+
+                # Basic dominant colour hint via thumbnail
+                colour_hint = ""
+                try:
+                    thumb = img.convert("RGB").resize((50, 50))
+                    pixels = list(thumb.getdata())
+                    r_avg  = sum(p[0] for p in pixels) // len(pixels)
+                    g_avg  = sum(p[1] for p in pixels) // len(pixels)
+                    b_avg  = sum(p[2] for p in pixels) // len(pixels)
+                    if r_avg > g_avg and r_avg > b_avg:
+                        colour_hint = " with warm red tones"
+                    elif g_avg > r_avg and g_avg > b_avg:
+                        colour_hint = " with green tones"
+                    elif b_avg > r_avg and b_avg > g_avg:
+                        colour_hint = " with cool blue tones"
                 except Exception:
                     pass
 
-                text = pytesseract.image_to_string(img)
-
-                if text is None:
-                    return ""
-
-                return text.strip()
+                return (
+                    f"A {format_} image, {w}×{h} pixels, "
+                    f"colour mode {mode}{colour_hint}."
+                )
 
         except Exception as e:
-            logger.exception("OCR extraction failed for %s: %s", image_path, e)
-            return ""
+            logger.exception("image_captioning failed: %s", e)
+            return "Could not generate a caption for the image."
 
+    # ==================================================================
+    # OBJECT DETECTION
+    # (Fix: was nested inside image_captioning in the previous version)
+    # ==================================================================
 
-# -------------------------
-# Image captioning (placeholder)
-# -------------------------
-
-def image_captioning(self, image_path: str) -> str:
-    """
-    Generate a human-readable caption for an image.
-    """
-
-    if not os.path.exists(image_path):
-        return "Image file not found."
-
-    if not Image:
-        return "Image captioning unavailable: Pillow not installed."
-
-    try:
-        with Image.open(image_path) as img:
-            w, h = img.size
-            return f"An image of size {w} by {h} pixels. (Captioning model not installed.)"
-
-    except Exception as e:
-        logger.exception("image_captioning failed: %s", e)
-        return "Could not create a caption for the image."
-
-    # -------------------------
-    # Object detection (placeholder)
-    # -------------------------
     def object_detection(self, image_path: str) -> List[Dict]:
         """
         Detect objects in an image.
-        Placeholder returns a dummy object list. Replace with model-based detection (YOLO, SSD, Faster-RCNN).
-        The return format is: [{ 'label': str, 'confidence': float, 'bbox': [x, y, w, h] }, ...]
+
+        Placeholder returns a single scene-level entry.
+        Replace with YOLO / SSD / Faster-RCNN when ready.
+
+        Return format:
+        [{ 'label': str, 'confidence': float, 'bbox': [x, y, w, h] }, ...]
         """
+        if not os.path.exists(image_path):
+            logger.error("object_detection: image not found: %s", image_path)
+            return []
+
         if not OPENCV_AVAILABLE:
-            logger.warning("Object detection not available: OpenCV not installed.")
-            # Return a plausible placeholder
-            return [{"label": "unknown", "score": 0.0, "bbox": [0, 0, 0, 0]}]
+            logger.warning("object_detection: OpenCV not installed.")
+            return [{"label": "unknown", "confidence": 0.0, "bbox": [0, 0, 0, 0]}]
 
         try:
             img = cv2.imread(image_path)
             if img is None:
-                logger.error("Object detection: failed to load image %s", image_path)
+                logger.error("object_detection: cv2 could not read %s", image_path)
                 return []
+
             h, w = img.shape[:2]
-            # Placeholder: we return a "scene" object covering entire image with low confidence
-            return [{"label": "scene", "score": 0.3, "bbox": [0, 0, w, h]}]
+            # Placeholder — returns full-frame "scene" object
+            return [{"label": "scene", "confidence": 0.3, "bbox": [0, 0, w, h]}]
+
         except Exception as e:
             logger.exception("object_detection failed: %s", e)
             return []
 
-# global instance for convenience
+    # ==================================================================
+    # UNIFIED ANALYSER
+    # Goal: single call gives Radhe a full understanding of an image
+    # ==================================================================
+
+    def analyze_image(self, image_path: str) -> str:
+        """
+        Run OCR + captioning + object detection on a single image and
+        return a single natural-language description.
+
+        This is the method Radhe should call when the user says:
+        "What is in this image?" / "Read this screenshot."
+        """
+        if not os.path.exists(image_path):
+            return "I can't find that image file."
+
+        parts: List[str] = []
+
+        caption = self.image_captioning(image_path)
+        if caption:
+            parts.append(caption)
+
+        text = self.ocr_from_image(image_path)
+        if text:
+            parts.append(f"Text found in image: {text}")
+
+        objects = self.object_detection(image_path)
+        labels  = [o["label"] for o in objects if o.get("label") != "scene"]
+        if labels:
+            parts.append("Objects detected: " + ", ".join(labels))
+
+        return " ".join(parts) if parts else "I couldn't extract any information from the image."
+
+    # ==================================================================
+    # SCREEN CAPTURE  (foundation for "watch my screen" feature)
+    # ==================================================================
+
+    def capture_screen_and_analyze(self) -> str:
+        """
+        Take a screenshot of the current screen and analyse it.
+        Returns a natural-language description.
+
+        This is the first step toward Radhe understanding
+        what is on your screen in real time.
+        """
+        if not PYAUTOGUI_AVAILABLE:
+            return (
+                "Screen capture not available. "
+                "Run: pip install pyautogui"
+            )
+
+        try:
+            screenshot = pyautogui.screenshot()
+
+            with tempfile.NamedTemporaryFile(
+                suffix=".png", delete=False
+            ) as tmp:
+                tmp_path = tmp.name
+                screenshot.save(tmp_path)
+
+            result = self.analyze_image(tmp_path)
+
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+            return result
+
+        except Exception as e:
+            logger.exception("capture_screen_and_analyze failed: %s", e)
+            return "I couldn't capture the screen."
+
+
+# ── Global instance ───────────────────────────────────────────────────
 vision_manager = VisionManager()

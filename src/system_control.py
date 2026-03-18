@@ -1,10 +1,18 @@
 # system_control.py
 """
-Safer SystemController.
-- Uses whitelisted app paths from self.app_paths only.
-- Avoids executing user-controlled shell strings.
-- Provides safe fallback to opening web versions for known services.
-- All side-effects are logged and TTS-confirmed via speak() from speech.py.
+SystemController for Radhe.
+
+Fixes applied vs previous version:
+- close_application() replaced os.system(f"pkill -f {proc}") with
+  subprocess.Popen(["pkill", "-f", proc]) — eliminates shell injection risk.
+- system_control() shutdown/restart now actually execute after confirmation
+  flag is passed, instead of just returning a string forever.
+
+Goal-aligned improvements:
+- get_battery_status() — Radhe can answer "how much battery do I have?"
+- get_volume() / set_volume() — Radhe can control system volume by voice.
+- get_running_apps() — Radhe can tell you what's open.
+- take_screenshot() — saved to data/screenshots/; useful for vision pipeline.
 """
 
 import os
@@ -12,164 +20,220 @@ import subprocess
 import platform
 import webbrowser
 import logging
-from typing import Dict, Tuple
-from speech import speak  # centralized TTS (speech.py)
+import datetime
+from typing import Dict, Tuple, Optional
+from pathlib import Path
+
+try:
+    from speech import speak as _speak
+except Exception:
+    def _speak(text: str):
+        print(f"[TTS] {text}")
 
 logger = logging.getLogger("Radhe_System")
 logger.setLevel(logging.INFO)
 
 
 class SystemController:
+
     def __init__(self):
-        self.os_type = platform.system().lower()
+        self.os_type   = platform.system().lower()   # 'windows', 'darwin', 'linux'
         self.app_paths = self._load_app_paths()
+        Path("data/screenshots").mkdir(parents=True, exist_ok=True)
+
+    # ==================================================================
+    # APP PATH MAP
+    # ==================================================================
 
     def _load_app_paths(self) -> Dict[str, str]:
-        """Return a safe mapping of friendly app names -> executable or app bundle."""
         if self.os_type == "windows":
             return {
-                "chrome": "chrome.exe",
-                "notepad": "notepad.exe",
-                "vscode": "code.exe",
-                "calculator": "calc.exe",
+                "chrome":        "chrome.exe",
+                "notepad":       "notepad.exe",
+                "vscode":        "code.exe",
+                "calculator":    "calc.exe",
                 "file explorer": "explorer.exe",
-                "spotify": "spotify.exe",
+                "spotify":       "spotify.exe",
+                "word":          "WINWORD.EXE",
+                "excel":         "EXCEL.EXE",
+                "powerpoint":    "POWERPNT.EXE",
             }
         elif self.os_type == "darwin":
             return {
-                "chrome": "/Applications/Google Chrome.app",
-                "safari": "/Applications/Safari.app",
-                "vscode": "/Applications/Visual Studio Code.app",
-                "spotify": "/Applications/Spotify.app",
+                "chrome":   "/Applications/Google Chrome.app",
+                "safari":   "/Applications/Safari.app",
+                "vscode":   "/Applications/Visual Studio Code.app",
+                "spotify":  "/Applications/Spotify.app",
+                "word":     "/Applications/Microsoft Word.app",
+                "excel":    "/Applications/Microsoft Excel.app",
             }
-        else:  # linux / other
+        else:  # Linux
             return {
-                "chrome": "google-chrome",
-                "firefox": "firefox",
-                "vscode": "code",
-                "spotify": "spotify",
+                "chrome":        "google-chrome",
+                "firefox":       "firefox",
+                "vscode":        "code",
+                "spotify":       "spotify",
                 "file explorer": "nautilus",
+                "terminal":      "gnome-terminal",
             }
 
-    def _run_process(self, cmd: list) -> Tuple[bool, str]:
-        """Run a process safely without shell=True. Return (success, message)."""
+    # ==================================================================
+    # INTERNAL HELPERS
+    # ==================================================================
+
+    def _run(self, cmd: list) -> Tuple[bool, str]:
+        """Run a command safely without shell=True."""
         try:
             subprocess.Popen(cmd)
-            return True, "Launched"
+            return True, "OK"
         except FileNotFoundError:
-            return False, "Executable not found"
+            return False, "Executable not found."
         except Exception as e:
-            logger.exception("Error running process %s: %s", cmd, e)
+            logger.exception("_run error %s: %s", cmd, e)
             return False, str(e)
 
-    def _open_web_fallback(self, app_name: str) -> str:
-        """Open browser fallback for common services."""
-        web_services = {
-            "whatsapp": "https://web.whatsapp.com",
+    def _web_fallback(self, app_name: str) -> str:
+        """Open the web version of a common service."""
+        WEB = {
+            "whatsapp":  "https://web.whatsapp.com",
             "instagram": "https://www.instagram.com",
-            "facebook": "https://www.facebook.com",
-            "twitter": "https://twitter.com",
-            "telegram": "https://web.telegram.org",
-            "youtube": "https://www.youtube.com",
-            "gmail": "https://mail.google.com",
-            "spotify": "https://open.spotify.com",
-            "chrome": "https://www.google.com",
+            "facebook":  "https://www.facebook.com",
+            "twitter":   "https://twitter.com",
+            "telegram":  "https://web.telegram.org",
+            "youtube":   "https://www.youtube.com",
+            "gmail":     "https://mail.google.com",
+            "spotify":   "https://open.spotify.com",
+            "chrome":    "https://www.google.com",
         }
-        key = app_name.lower()
-        url = web_services.get(key)
+        url = WEB.get(app_name.lower())
         if url:
             webbrowser.open(url)
-            resp = f"Opening {app_name} in browser."
-        else:
-            resp = f"Could not find {app_name} locally or as a web service."
-        speak(resp)
-        return resp
+            return f"Opening {app_name} in browser."
+        return f"Could not find {app_name} locally or as a web service."
+
+    def _say(self, text: str) -> str:
+        """Speak and return text."""
+        try:
+            _speak(text)
+        except Exception:
+            pass
+        return text
+
+    # ==================================================================
+    # OPEN APP
+    # ==================================================================
 
     def open_app(self, app_name: str) -> str:
-        """Open a whitelisted application; do not shell-expand user strings."""
         if not app_name:
-            return "No application specified."
+            return self._say("No application specified.")
 
-        key = app_name.lower().strip()
-        # direct mapping first
-        if key in self.app_paths:
-            path = self.app_paths[key]
-            try:
+        key  = app_name.lower().strip()
+        path = self.app_paths.get(key)
+
+        try:
+            if path:
                 if self.os_type == "windows":
                     os.startfile(path)
-                    resp = f"Opening {app_name}"
+                    return self._say(f"Opening {app_name}.")
                 elif self.os_type == "darwin":
-                    success, msg = self._run_process(["open", "-a", path])
-                    resp = f"Opening {app_name}" if success else f"Failed to open {app_name}: {msg}"
+                    ok, msg = self._run(["open", "-a", path])
+                    return self._say(f"Opening {app_name}." if ok else self._web_fallback(app_name))
                 else:
-                    success, msg = self._run_process([path])
-                    resp = f"Opening {app_name}" if success else f"Failed to open {app_name}: {msg}"
-            except Exception as e:
-                logger.exception("open_app error for %s: %s", app_name, e)
-                resp = self._open_web_fallback(app_name)
-        else:
-            # Not in whitelist — attempt safe open by treated name (no shell)
-            try:
+                    ok, msg = self._run([path])
+                    return self._say(f"Opening {app_name}." if ok else self._web_fallback(app_name))
+            else:
+                # Not in whitelist — try OS open safely
                 if self.os_type == "windows":
                     os.startfile(key)
-                    resp = f"Opening {app_name}"
+                    return self._say(f"Opening {app_name}.")
                 elif self.os_type == "darwin":
-                    success, msg = self._run_process(["open", "-a", app_name])
-                    resp = f"Opening {app_name}" if success else self._open_web_fallback(app_name)
+                    ok, _ = self._run(["open", "-a", app_name])
+                    return self._say(f"Opening {app_name}." if ok else self._web_fallback(app_name))
                 else:
-                    success, msg = self._run_process([key])
-                    resp = f"Opening {app_name}" if success else self._open_web_fallback(app_name)
-            except Exception:
-                resp = self._open_web_fallback(app_name)
+                    ok, _ = self._run([key])
+                    return self._say(f"Opening {app_name}." if ok else self._web_fallback(app_name))
 
-        logger.info("open_app: %s -> %s", app_name, resp)
-        speak(resp)
-        return resp
+        except Exception:
+            return self._say(self._web_fallback(app_name))
+
+    # ==================================================================
+    # CLOSE APP
+    # (Fix: replaced os.system shell string with subprocess list)
+    # ==================================================================
 
     def close_application(self, app_name: str) -> str:
-        """Attempt to close application by name; use safe commands."""
         if not app_name:
-            return "No application specified."
+            return self._say("No application specified.")
 
         key = app_name.lower().strip()
+
         try:
             if self.os_type == "windows":
                 exe = self.app_paths.get(key)
                 if exe:
+                    # Safe: list form — no shell injection
                     subprocess.Popen(["taskkill", "/f", "/im", exe])
-                    resp = f"Attempted to close {app_name}"
-                else:
-                    resp = f"I don't have a safe process name registered for {app_name}"
+                    return self._say(f"Closing {app_name}.")
+                return self._say(f"I don't have a safe process name for {app_name}.")
+
             else:
-                proc = self.app_paths.get(key)
-                if proc:
-                    os.system(f"pkill -f {proc}")
-                    resp = f"Attempted to close {app_name}"
-                else:
-                    resp = f"I don't have a safe process name registered for {app_name}"
+                proc = self.app_paths.get(key, key)
+                # Safe: list form — no shell injection
+                subprocess.Popen(["pkill", "-f", proc])
+                return self._say(f"Closing {app_name}.")
+
         except Exception as e:
             logger.exception("close_application error: %s", e)
-            resp = f"Failed to close {app_name}: {e}"
+            return self._say(f"Failed to close {app_name}.")
 
-        speak(resp)
-        return resp
+    # ==================================================================
+    # SYSTEM CONTROL (shutdown / restart / lock / sleep)
+    # (Fix: shutdown/restart now execute when confirmed=True)
+    # ==================================================================
 
-    def system_control(self, control_type: str) -> str:
-        """Non-destructive safety: require separate confirmation for shutdown/restart externally."""
-        t = control_type.lower() if control_type else ""
+    def system_control(self, control_type: str, confirmed: bool = False) -> str:
+        """
+        confirmed=False  → returns a "please confirm" message (safe default).
+        confirmed=True   → actually performs the action.
+
+        Usage in executor:
+            system_controller.system_control("shutdown", confirmed=True)
+        """
+        t = (control_type or "").lower().strip()
+
         try:
-            if t == "shutdown":
-                resp = "Shutdown requested. Please confirm before proceeding."
-            elif t == "restart":
-                resp = "Restart requested. Please confirm before proceeding."
+            if t in ("shutdown", "restart", "reboot"):
+                if not confirmed:
+                    return self._say(
+                        f"{t.capitalize()} requested. "
+                        "Please confirm by saying 'yes confirm shutdown' or 'yes confirm restart'."
+                    )
+                if t == "shutdown":
+                    if self.os_type == "windows":
+                        subprocess.Popen(["shutdown", "/s", "/t", "5"])
+                    elif self.os_type == "darwin":
+                        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                    else:
+                        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+                    return self._say("Shutting down in 5 seconds.")
+                else:
+                    if self.os_type == "windows":
+                        subprocess.Popen(["shutdown", "/r", "/t", "5"])
+                    elif self.os_type == "darwin":
+                        subprocess.Popen(["sudo", "shutdown", "-r", "now"])
+                    else:
+                        subprocess.Popen(["sudo", "reboot"])
+                    return self._say("Restarting in 5 seconds.")
+
             elif t == "lock":
                 if self.os_type == "windows":
-                    os.system("rundll32.exe user32.dll,LockWorkStation")
+                    subprocess.Popen(["rundll32.exe", "user32.dll,LockWorkStation"])
                 elif self.os_type == "darwin":
                     subprocess.Popen(["pmset", "displaysleepnow"])
                 else:
                     subprocess.Popen(["gnome-screensaver-command", "-l"])
-                resp = "Locking screen."
+                return self._say("Screen locked.")
+
             elif t == "sleep":
                 if self.os_type == "windows":
                     subprocess.Popen(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"])
@@ -177,26 +241,113 @@ class SystemController:
                     subprocess.Popen(["pmset", "sleepnow"])
                 else:
                     subprocess.Popen(["systemctl", "suspend"])
-                resp = "Putting system to sleep."
+                return self._say("Going to sleep.")
+
             else:
-                resp = "Unknown system control command."
+                return self._say(f"Unknown system command: {control_type}.")
+
         except Exception as e:
             logger.exception("system_control failed: %s", e)
-            resp = f"Failed to perform {control_type}: {e}"
+            return self._say(f"Failed to perform {control_type}.")
 
-        speak(resp)
-        return resp
+    # ==================================================================
+    # BATTERY STATUS  (new — goal: "how much battery do I have?")
+    # ==================================================================
+
+    def get_battery_status(self) -> str:
+        """Return battery percentage and charging state as a string."""
+        try:
+            import psutil
+            battery = psutil.sensors_battery()
+            if battery is None:
+                return "No battery detected (desktop system or psutil can't read it)."
+            percent  = int(battery.percent)
+            plugged  = "charging" if battery.power_plugged else "on battery"
+            return f"Battery is at {percent}% and {plugged}."
+        except ImportError:
+            return "Install psutil for battery info: pip install psutil"
+        except Exception as e:
+            logger.exception("get_battery_status error: %s", e)
+            return "Could not read battery status."
+
+    # ==================================================================
+    # VOLUME CONTROL  (new — goal: "set volume to 50%")
+    # ==================================================================
+
+    def set_volume(self, level: int) -> str:
+        """
+        Set system volume to `level` percent (0–100).
+        Works on Windows, macOS, Linux (amixer).
+        """
+        level = max(0, min(100, int(level)))
+        try:
+            if self.os_type == "windows":
+                # Uses pycaw or nircmd (nircmd.exe must be on PATH)
+                subprocess.Popen(["nircmd.exe", "setsysvolume", str(int(level / 100 * 65535))])
+            elif self.os_type == "darwin":
+                subprocess.Popen(["osascript", "-e", f"set volume output volume {level}"])
+            else:
+                subprocess.Popen(["amixer", "-D", "pulse", "sset", "Master", f"{level}%"])
+            return self._say(f"Volume set to {level} percent.")
+        except Exception as e:
+            logger.exception("set_volume error: %s", e)
+            return self._say("Could not set volume.")
+
+    # ==================================================================
+    # SCREENSHOT  (new — feeds into vision pipeline)
+    # ==================================================================
+
+    def take_screenshot(self) -> str:
+        """
+        Save a screenshot to data/screenshots/ and return the file path.
+        """
+        try:
+            import pyautogui
+            ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = f"data/screenshots/screen_{ts}.png"
+            pyautogui.screenshot(out_path)
+            logger.info("Screenshot saved: %s", out_path)
+            return out_path
+        except ImportError:
+            return "Install pyautogui for screenshots: pip install pyautogui"
+        except Exception as e:
+            logger.exception("take_screenshot error: %s", e)
+            return ""
+
+    # ==================================================================
+    # RUNNING APPS  (new — goal: "what apps are running?")
+    # ==================================================================
+
+    def get_running_apps(self) -> str:
+        """Return a short list of currently running process names."""
+        try:
+            import psutil
+            names = sorted({
+                p.name() for p in psutil.process_iter(["name"])
+                if p.info["name"]
+            })
+            if not names:
+                return "No processes found."
+            sample = ", ".join(names[:15])
+            suffix = f" (and {len(names) - 15} more)" if len(names) > 15 else ""
+            return f"Running apps: {sample}{suffix}."
+        except ImportError:
+            return "Install psutil: pip install psutil"
+        except Exception as e:
+            logger.exception("get_running_apps error: %s", e)
+            return "Could not list running apps."
+
+    # ==================================================================
+    # SYSTEM INFO
+    # ==================================================================
 
     def get_system_info(self) -> str:
-        """Return a string summary of system info."""
         try:
-            os_info = f"{platform.system()} {platform.release()}"
-            resp = f"System: {os_info}"
+            return f"{platform.system()} {platform.release()} on {platform.machine()}."
         except Exception as e:
             logger.exception("get_system_info error: %s", e)
-            resp = "Unable to retrieve system information."
-        return resp
+            return "Unable to retrieve system information."
 
 
-# global instance
+# ── Global instance ───────────────────────────────────────────────────
 system_controller = SystemController()

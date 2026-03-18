@@ -1,190 +1,104 @@
-# radhe.py
+# src/interfaces/radhe.py
+"""
+Radhe — Voice Interface Entry Point.
 
-import logging
-from threading import Thread
+Updates vs previous version:
+- WhatsApp listener wired in via social_integrator.
+- Executor connected to social_integrator for auto-reply capability.
+- Graceful KeyboardInterrupt / shutdown handling.
+"""
+
 import time
-import requests
-import os
-from dotenv import load_dotenv
+import logging
 
 from src.command_parser import CommandParser
 from src.command_executor import executor
 from speech import speak, listen_for_wake_word, capture_multi_commands
 from reminder_manager import ReminderManager
+from social_media import social_integrator
 
-# Google contacts sync optional
-try:
-    from src.google_contacts import sync_to_local
-except Exception:
-    sync_to_local = None
+# 🔥 LLM engine — attaches brain.llm_client (must run before any ai_knowledge call)
+import src.llm_setup  # noqa: F401
 
-from src.ai_knowledge import brain
-
-# ---------------------------
-# ENV LOAD (for API keys)
-# ---------------------------
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-# ---------------------------
-# LOGGING
-# ---------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s  [%(levelname)s]  %(name)s — %(message)s"
 )
 logger = logging.getLogger("Radhe_Main")
 
-# ---------------------------
-# LOCAL LLM (Ollama)
-# ---------------------------
-def local_llm(prompt: str, meta: dict) -> str:
-    try:
-        resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3.1",
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=60
-        )
+WAKE_WORD = "radhe"
+COOLDOWN  = 1.5   # seconds between commands
 
-        if resp.status_code != 200:
-            logger.error("Ollama HTTP %s: %s", resp.status_code, resp.text[:200])
-            return ""
 
-        data = resp.json()
-        response = data.get("response", "").strip()
-
-        if not response:
-            return "I couldn't generate a response."
-
-        return response
-
-    except Exception as e:
-        logger.error("local_llm error: %s", e)
-        return ""
-
-# ---------------------------
-# CLOUD LLM (Groq)
-# ---------------------------
-def cloud_llm(prompt: str, meta: dict) -> str:
-    if not GROQ_API_KEY:
-        return ""
-
-    try:
-        url = "https://api.groq.com/openai/v1/chat/completions"
-
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        data = {
-            "model": "llama3-70b-8192",
-            "messages": [
-                {"role": "user", "content": prompt}
-            ]
-        }
-
-        resp = requests.post(url, headers=headers, json=data, timeout=20)
-        result = resp.json()
-
-        return result["choices"][0]["message"]["content"]
-
-    except Exception as e:
-        logger.error("cloud_llm error: %s", e)
-        return ""
-
-# ---------------------------
-# SMART LLM (Hybrid)
-# ---------------------------
-def smart_llm(prompt: str, meta: dict) -> str:
-    # 1️⃣ Try cloud first
-    response = cloud_llm(prompt, meta)
-    if response:
-        return response
-
-    # 2️⃣ fallback to local
-    return local_llm(prompt, meta)
-
-# Attach brain
-brain.llm_client = smart_llm
-
-# ---------------------------
-# VOICE LOOP
-# ---------------------------
-def voice_command_loop(wake_word: str = "radhe"):
-
+def run():
     parser = CommandParser()
-    logger.info("Voice command loop ready. Say '%s' to wake me.", wake_word)
+
+    # ── Reminder manager ──────────────────────────────────────────────
+    rm = ReminderManager(speak)
+    rm.start()
+    executor.context["reminder_manager"] = rm
+    logger.info("Reminder manager started.")
+
+    # ── WhatsApp listener ─────────────────────────────────────────────
+    # Connects executor so incoming WA messages can be auto-replied to.
+    try:
+        social_integrator.connect_executor(executor)
+        social_integrator.listen_whatsapp()
+        logger.info("WhatsApp listener started.")
+    except Exception as e:
+        logger.warning("WhatsApp listener could not start: %s", e)
+
+    # ── Startup ───────────────────────────────────────────────────────
+    speak("Radhe is ready. Say Radhe to wake me.")
+    logger.info("Voice loop started. Wake word: '%s'", WAKE_WORD)
+
+    last_execution_time = 0.0
 
     while True:
         try:
-            # Wake word
-            if not listen_for_wake_word(wake_word=wake_word):
+
+            # Cooldown between commands
+            if time.time() - last_execution_time < COOLDOWN:
+                time.sleep(0.2)
+                continue
+
+            # Wait for wake word
+            if not listen_for_wake_word(WAKE_WORD):
                 continue
 
             # Capture command
-            commands = capture_multi_commands(command_lang="en", phrase_limit=15)
-            if not commands:
+            cmds = capture_multi_commands()
+            if not cmds:
+                speak("I didn't catch that. Please try again.")
                 continue
 
-            text = (commands[0] or "").strip()
+            text = cmds[0].strip()
             if not text:
                 continue
 
-            logger.info("Heard command: %s", text)
+            logger.info("Command: %s", text)
 
-            # Parse
+            # Parse → Execute → Speak
             parsed = parser.parse(text)
+            result = executor.execute(parsed, text)
 
-            # Execute
-            result = executor.execute(parsed, text, executor.context)
+            reply = result.get("voice") or result.get("text", "")
+            if reply:
+                speak(reply)
 
-            # Speak
-            reply_voice = result.get("voice") or result.get("text", "")
-            if reply_voice:
-                speak(reply_voice)
-
-            logger.info("Response: %s", result.get("text", ""))
-
-            time.sleep(0.3)
+            last_execution_time = time.time()
 
         except KeyboardInterrupt:
-            logger.info("Stopping Radhe...")
+            logger.info("Shutting down Radhe...")
+            speak("Goodbye!")
+            rm.stop()
             break
+
         except Exception as e:
             logger.exception("Voice loop error: %s", e)
             speak("Something went wrong. Please try again.")
             time.sleep(1)
 
-# ---------------------------
-# MAIN
-# ---------------------------
+
 if __name__ == "__main__":
-    logger.info("Starting Radhe...")
-
-    # Google contacts sync
-    if sync_to_local is not None:
-        def auto_sync_contacts():
-            try:
-                logger.info("📇 Syncing Google contacts...")
-                count = sync_to_local()
-                logger.info("📇 Synced %d contacts", count)
-            except Exception as e:
-                logger.error("Contacts sync failed: %s", e)
-
-        Thread(target=auto_sync_contacts, daemon=True).start()
-
-    # Reminder manager
-    rm = ReminderManager(speak)
-    rm.start()
-    executor.context["reminder_manager"] = rm
-
-    # Startup voice
-    speak("Hello Shivam, Radhe is ready.")
-
-    # Start voice loop
-    voice_command_loop("radhe")
+    run()
