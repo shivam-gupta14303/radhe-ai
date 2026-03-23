@@ -1,4 +1,4 @@
-# src/brain/llm_setup.py
+# llm_setup.py
 """
 LLM Engine for Radhe.
 
@@ -10,7 +10,7 @@ Fixes applied:
 - Local Ollama also receives history formatted into the prompt string
 
 Import once at startup (side effect: attaches brain.llm_client):
-    import src.brain.llm_setup
+    import brain.llm_setup
 """
 
 import os
@@ -19,13 +19,13 @@ import requests
 from typing import List, Dict, Any
 
 from dotenv import load_dotenv
-from src.ai_knowledge import brain
+from ai_knowledge import brain
 
 load_dotenv()
 
 logger        = logging.getLogger("Radhe_LLM")
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL    = "llama3-70b-8192"
+GROQ_MODEL    = "llama-3.1-70b-versatile"
 OLLAMA_MODEL  = "llama3.1"
 OLLAMA_URL    = "http://localhost:11434/api/generate"
 GROQ_URL      = "https://api.groq.com/openai/v1/chat/completions"

@@ -274,7 +274,7 @@ class SystemController:
     # VOLUME CONTROL  (new — goal: "set volume to 50%")
     # ==================================================================
 
-    def set_volume(self, level: int) -> str:
+    def  _set_volume_level(self, level: int) -> str:
         """
         Set system volume to `level` percent (0–100).
         Works on Windows, macOS, Linux (amixer).
@@ -292,6 +292,21 @@ class SystemController:
         except Exception as e:
             logger.exception("set_volume error: %s", e)
             return self._say("Could not set volume.")
+    
+    def set_volume(self, level=None, action: str = "") -> str:
+        if action:
+            action = action.lower()
+
+            if "up" in action or "louder" in action or "zyada" in action:
+                level = 80
+
+            elif "down" in action or "quieter" in action or "kam" in action:
+                level = 30
+
+        if level is None:
+            return self._say("Please specify a volume level.")
+
+        return self._set_volume_level(int(level))
 
     # ==================================================================
     # SCREENSHOT  (new — feeds into vision pipeline)
@@ -347,6 +362,30 @@ class SystemController:
         except Exception as e:
             logger.exception("get_system_info error: %s", e)
             return "Unable to retrieve system information."
+    def close_app(self, app_name: str) -> str:
+        return self.close_application(app_name)
+    # ===================================================================
+    # brightness control
+    #====================================================================
+    def set_brightness(self, level=None) -> str:
+        level = max(0, min(100, int(level or 50)))
+
+        try:
+            import subprocess
+
+            if self.os_type == "windows":
+                subprocess.Popen(["nircmd.exe", "setbrightness", str(level)])
+
+            elif self.os_type == "darwin":
+                subprocess.Popen(["brightness", str(level / 100)])
+
+            else:
+                subprocess.Popen(["brightnessctl", "set", f"{level}%"])
+
+            return self._say(f"Brightness set to {level} percent.")
+
+        except Exception:
+            return self._say("Could not set brightness.")
 
 
 # ── Global instance ───────────────────────────────────────────────────

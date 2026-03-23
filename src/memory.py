@@ -5,6 +5,7 @@ Thread-safe MemoryManager — SQLite backend.
 Tables:
 - memories         : generic text memory log
 - personal_profile : long-term per-user key-value store
+- contacts         : contact name → phone mapping  ✅ NEW
 
 Fix vs previous version:
 - print() replaced with logger throughout.
@@ -36,6 +37,8 @@ class MemoryManager:
         try:
             with _lock, self._connect() as conn:
                 cur = conn.cursor()
+
+                # EXISTING TABLES
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS memories (
                         id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +47,7 @@ class MemoryManager:
                         metadata  TEXT
                     )
                 """)
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS personal_profile (
                         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +59,15 @@ class MemoryManager:
                         UNIQUE(user_id, key)
                     )
                 """)
+
+                # ✅ NEW: CONTACTS TABLE
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        name TEXT PRIMARY KEY,
+                        phone TEXT
+                    )
+                """)
+
                 conn.commit()
         except Exception as e:
             logger.exception("Failed to initialise memory DB: %s", e)
@@ -174,3 +187,31 @@ class MemoryManager:
                 conn.commit()
         except Exception as e:
             logger.exception("clear_profile failed: %s", e)
+
+    # ==================================================================
+    # ✅ CONTACT STORAGE (CRITICAL FIX)
+    # ==================================================================
+
+    def save_contact(self, name: str, phone: str):
+        try:
+            with _lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO contacts (name, phone) VALUES (?, ?)",
+                    (name.lower(), phone)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.exception("save_contact failed: %s", e)
+
+    def get_contact(self, name: str):
+        try:
+            with _lock, self._connect() as conn:
+                cur = conn.execute(
+                    "SELECT phone FROM contacts WHERE name=?",
+                    (name.lower(),)
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.exception("get_contact failed: %s", e)
+            return None

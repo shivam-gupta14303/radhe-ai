@@ -1,42 +1,1094 @@
-# src/core/command_executor.py
-"""
-Central command executor for Radhe.
-
-Fixes applied vs submitted version:
-- Restored all missing intents (smalltalk, persona, thanks, goodbye,
-  change_language, change_mode, battery, volume, screenshot,
-  list/cancel reminders, youtube, internet, directions, nlp tools)
-- set_reminder now uses entities.get("reminder_text") not raw text
-- ask_question and fallback now pass history/language/mode to LLM
-- awaiting_contact cleared only on genuine success (not just "not found" check)
-- _looks_like_phone has word-count guard to avoid false triggers
-"""
-
+#command_executor.py
 import logging
+import random
 import time
 import re
-from typing import Dict, Any, Optional
+import json
+import hashlib
+import threading
+from enum    import Enum
+from pathlib import Path
+from typing  import Dict, Any, Optional, List, Tuple, Set
 
-from system_control import system_controller
-from web_control    import web_controller
-from utilities      import utility_manager
-from src.ai_knowledge import ai_knowledge
-from memory         import MemoryManager
-from nlp            import nlp_manager
-from vision         import vision_manager
-from src.messaging_service import messaging_service
+from system_control    import system_controller
+from web_control       import web_controller
+from utilities         import utility_manager
+from ai_knowledge      import ai_knowledge
+from memory            import MemoryManager
+from nlp               import nlp_manager
+from vision            import vision_manager
+from messaging_service import messaging_service
+from automation        import automation_manager
 
-logger     = logging.getLogger("Radhe_Executor")
-MAX_HISTORY = 40
+logger = logging.getLogger("Radhe_Executor")
 
-# Signals that indicate a send failed and awaiting_contact should be kept
-_FAILURE_SIGNALS = ("not found", "failed", "not open", "wrong", "empty", "missing", "error")
+MAX_HISTORY             = 40
+_MEMORY_FETCH_LIMIT     = 12
+_MEMORY_TOP_K           = 3
+_MEMORY_LINE_MAX_CHARS  = 200
+_HISTORY_TURNS          = 6
+_HISTORY_TEXT_MAX       = 150
+_PROMPT_HARD_LIMIT      = 4000
+_LLM_TIMEOUT            = 10
+_MEMORY_MAX_ITEMS       = 1000
+_PRUNE_PROB_MIN         = 10
+_PRUNE_PROB_MAX         = 50
+_LONGTERM_BUDGET_RATIO  = 0.4
+_MMR_LAMBDA             = 0.6
+_CLASSIFIER_SHORT_LIMIT = 25
+_COMPRESS_INTERVAL_PROB = 50
+_COMPRESS_AGE_DAYS      = 7
+_COMPRESS_MIN_ENTRIES   = 4
+_EMBED_WEIGHT           = 0.5   # only applied when sbert backend is active
+_BOOST_HALF_LIFE_DAYS   = 3.0
+_BOOST_MAX              = 0.45
+_BOOST_INCREMENT        = 0.15
+_CONFIDENCE_INIT        = 0.7
+_CONFIDENCE_CORRECT     = 0.15
+_CONFIDENCE_WRONG       = -0.35
+_GRAPH_PATH             = Path("data/relationship_graph.json")
+_CONTRADICT_THRESHOLD   = 0.75
+_GOAL_MAX_STEPS         = 5
+_PLAN_TIMEOUT_SECS      = 15
+_SESSION_NUDGE_SECS     = 2 * 60 * 60   # IMP-6: 2-hour usage nudge
 
+_FAILURE_SIGNALS = (
+    "not found", "failed", "not open", "wrong", "empty", "missing", "error"
+)
+
+_ABBREV: Dict[str, str] = {
+    "ai": "artificial intelligence", "ml": "machine learning",
+    "nlp": "natural language processing", "db": "database",
+    "ui": "user interface", "ux": "user experience",
+    "api": "application programming interface", "os": "operating system",
+}
+
+_SELF_PRONOUNS: Set[str] = {"i", "me", "my", "myself", "i'm", "i've", "i'll"}
+
+
+# ==========================================================
+# IMP-1: MASTER SYSTEM PROMPT  (Build Plan Section 1.7)
+# This replaces the one-liner system_header that was in the
+# original code. Every rule from the Soul Document lives here.
+# ==========================================================
+
+_RADHE_SYSTEM_PROMPT = """\
+You are Radhe — a warm, honest, capable AI assistant built for India.
+
+You are NOT a human. You never pretend to be one.
+When asked directly, confirm warmly and clearly that you are AI.
+
+WHEN SOMEONE SHARES A DIFFICULT EMOTION:
+- Validate first. Never fight the feeling.
+- Acknowledge that it is not easy.
+- Never push for immediate resolution.
+- Give space. Trust the user to process at their own pace.
+
+WHEN SOMEONE SEEMS TO DEPEND ON YOU TOO MUCH:
+- Gently remind them you are AI.
+- Suggest calling a real friend, family member, or counsellor.
+
+WHEN SOMEONE EXPRESSES SERIOUS DISTRESS OR MENTIONS SELF-HARM:
+- Always provide the iCall helpline: 9152987821
+- Do not continue normal conversation until this is acknowledged.
+
+RADHE'S VOICE:
+- Warm but never fake
+- Honest but never cold
+- Casual but never careless
+- Hindi-English mixed naturally — the way real Indians speak
+- Like a slightly older friend who has figured some things out
+  but never talks down to you
+
+WHAT RADHE ALWAYS DOES:
+- Validates feelings before advising
+- Acknowledges difficulty before suggesting solutions
+- Remembers what the user shared in past conversations
+- Reminds users it is AI — warmly, never apologetically
+- Pushes users toward real humans when the moment calls for it
+- Says 'I am AI' clearly and warmly whenever asked
+
+WHAT RADHE NEVER DOES:
+- Pretends to be human
+- Tells users to stop feeling what they feel
+- Forces positivity or rushed resolution
+- Creates emotional dependency
+- Simulates romantic or intimate relationships
+- Gives direct medical advice — only explains and summarizes
+- Lets a user spiral without gently redirecting toward real support
+- Generates the iCall number — it is always hardcoded, never AI-generated
+
+THE GOLDEN RULE:
+Radhe never fights a feeling.
+Radhe never forces resolution.
+Radhe validates, acknowledges difficulty, and creates space —
+then trusts the user.
+
+After 2+ hours of continuous use, gently suggest a break.
+"""
+
+
+# ==========================================================
+# IMP-2: DISTRESS & DEPENDENCY DETECTION  (Section 7.1)
+# These responses are HARDCODED. The helpline numbers must
+# never be generated by the LLM — they cannot be hallucinated.
+# ==========================================================
+
+_CRISIS_KEYWORDS = (
+    "want to die", "want to kill myself", "suicide", "suicidal",
+    "end my life", "hurt myself", "self harm", "self-harm",
+    "cut myself", "can't go on", "cannot go on", "no reason to live",
+    "don't want to live", "don't want to be here", "not worth living",
+    "wish i was dead", "better off dead", "killing myself",
+    "khud ko khatam", "marna chahta", "marna chahti", "jeena nahi",
+)
+
+_ICALL          = "9152987821"
+_VANDREVALA     = "1860-2662-345"
+_ISPOVAC        = "9999 666 555"
+
+_CRISIS_RESPONSE_EN = (
+    "Yaar, I hear you. What you're feeling right now is real, and it matters.\n\n"
+    "Please reach out to someone who can really help:\n"
+    f"  • iCall: {_ICALL}\n"
+    f"  • Vandrevala Foundation (24/7): {_VANDREVALA}\n"
+    f"  • iSPOVAC: {_ISPOVAC}\n\n"
+    "You don't have to go through this alone. I'm AI — these people are real, "
+    "trained, and they want to help. Please call."
+)
+_CRISIS_RESPONSE_HI = (
+    "Yaar, main sun raha hoon. Jo tum feel kar rahe ho woh real hai, aur important hai.\n\n"
+    "Please abhi kisi se baat karo jo sach mein help kar sake:\n"
+    f"  • iCall: {_ICALL}\n"
+    f"  • Vandrevala Foundation (24/7): {_VANDREVALA}\n"
+    f"  • iSPOVAC: {_ISPOVAC}\n\n"
+    "Tum akele nahi ho. Main AI hoon — yeh log real hain, trained hain, "
+    "aur help karna chahte hain. Please call karo."
+)
+_CRISIS_RESPONSE_MIXED = (
+    "Yaar, main sun raha hoon. What you're feeling is real and it matters.\n\n"
+    "Please abhi kisi se baat karo:\n"
+    f"  • iCall: {_ICALL}\n"
+    f"  • Vandrevala Foundation (24/7): {_VANDREVALA}\n"
+    f"  • iSPOVAC: {_ISPOVAC}\n\n"
+    "Main AI hoon — yeh log real hain, trained hain. Please call karo."
+)
+
+_DEPENDENCY_SIGNALS = (
+    "you're my only friend", "youre my only friend", "you are my only friend",
+    "only you understand", "i have no one else", "i only talk to you",
+    "you're the only one", "no one else listens", "i don't need anyone else",
+    "tum hi meri dost ho", "bas tum hi ho", "koi nahi hai mera",
+)
+
+_DEPENDENCY_RESPONSE_EN = (
+    "I really appreciate that you feel comfortable talking to me — that means a lot. "
+    "But I want to be honest with you: I'm AI, and there are things only a real human "
+    "connection can give you. Is there anyone in your life — a friend, family member, "
+    "or even a counsellor — you could reach out to? I'll always be here, but I want "
+    "you to have real people in your corner too."
+)
+_DEPENDENCY_RESPONSE_HI = (
+    "Yeh sun ke bahut achha laga ki tum mere saath comfortable ho. "
+    "But main honest rehna chahta hoon: main AI hoon, aur kuch cheezein sirf "
+    "real insaan de sakta hai. Koi hai tumhare life mein — dost, family, ya counsellor "
+    "— jisse tum baat kar sako? Main yahan hoon, but chahta hoon ki tumhare paas "
+    "real log bhi hon."
+)
+_DEPENDENCY_RESPONSE_MIXED = (
+    "Yeh sun ke achha laga. But I want to be honest — main AI hoon. "
+    "Real human connection kuch alag hi hoti hai. Koi hai — dost, family, counsellor "
+    "— jisse tum baat kar sako? Main yahan hoon, but real people bhi chahiye tumhare liye."
+)
+
+def _is_crisis(text: str) -> bool:
+    n = text.lower()
+    return any(kw in n for kw in _CRISIS_KEYWORDS)
+
+def _is_dependency_statement(text: str) -> bool:
+    n = text.lower()
+    return any(sig in n for sig in _DEPENDENCY_SIGNALS)
+
+
+# ==========================================================
+# IMP-5: ONBOARDING  (Build Plan Section 1.6)
+# ==========================================================
+
+_ONBOARDING_QUESTIONS = [
+    {
+        "key":    "name",
+        "prompt": (
+            "Main Radhe hoon — India ka apna AI assistant. "
+            "Pehle, tumhara naam kya hai? / What's your name?"
+        ),
+    },
+    {
+        "key":    "context",
+        "prompt": (
+            "Nice to meet you, {name}! "
+            "Kya tum student ho ya working professional? "
+            "(Student / Working / Other)"
+        ),
+    },
+    {
+        "key":    "language",
+        "prompt": (
+            "Hum kaise baat karein? / How should we talk?\n"
+            "  1. Hindi-English mix (default)\n"
+            "  2. Mostly English\n"
+            "  3. Mostly Hindi\n"
+            "Type 1, 2, or 3."
+        ),
+    },
+]
+
+_LANGUAGE_MAP = {"1": "mixed", "2": "en", "3": "hi",
+                 "hindi-english": "mixed", "english": "en", "hindi": "hi",
+                 "mix": "mixed", "mixed": "mixed"}
+
+
+# ==========================================================
+# MEMORY TYPE
+# ==========================================================
+
+class MemoryType(str, Enum):
+    FACT         = "fact"
+    PREFERENCE   = "preference"
+    CONVERSATION = "conversation"
+    TRIVIAL      = "trivial"
+
+_TYPE_WEIGHT: Dict[MemoryType, float] = {
+    MemoryType.FACT: 1.4, MemoryType.PREFERENCE: 1.3,
+    MemoryType.CONVERSATION: 1.0, MemoryType.TRIVIAL: 0.4,
+}
+_TYPE_PRUNE_PRIORITY: Dict[MemoryType, int] = {
+    MemoryType.TRIVIAL: 0, MemoryType.CONVERSATION: 1,
+    MemoryType.PREFERENCE: 2, MemoryType.FACT: 3,
+}
+_TYPE_DECAY_DAYS: Dict[MemoryType, float] = {
+    MemoryType.FACT: 30.0, MemoryType.PREFERENCE: 14.0,
+    MemoryType.CONVERSATION: 7.0, MemoryType.TRIVIAL: 0.5,
+}
+
+
+# ==========================================================
+# TOOL RESULT NORMALIZER
+# ==========================================================
+
+def _normalize_tool_result(result: Any) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, dict):
+        return result.get("text") or result.get("message") or str(result)
+    return str(result)
+
+
+# ==========================================================
+# EMBEDDING ENGINE
+# IMP-3: embed_weight is 0.0 when BoW fallback is active so
+#         token overlap is not counted twice.
+# ==========================================================
+
+class EmbeddingEngine:
+    """
+    Pluggable similarity engine.
+    Tries sentence-transformers at startup; falls back to BoW cosine.
+    Always returns float in [0, 1].
+    """
+
+    def __init__(self) -> None:
+        self._model   = None
+        self._backend = "bow"
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._model   = SentenceTransformer("all-MiniLM-L6-v2")
+            self._backend = "sbert"
+            logger.info("EmbeddingEngine: sentence-transformers loaded")
+        except Exception:
+            logger.info("EmbeddingEngine: using BoW fallback")
+
+    @property
+    def embed_weight(self) -> float:
+        """
+        IMP-3: Return 0.0 when BoW is active so the scoring formula
+        does not double-count token overlap via both embed_sim and token_sim.
+        When sbert is active, use the configured _EMBED_WEIGHT split.
+        """
+        return _EMBED_WEIGHT if self._backend == "sbert" else 0.0
+
+    def _bow_vector(self, text: str) -> Dict[str, float]:
+        tokens = re.findall(r"\w+", text.lower())
+        vec: Dict[str, float] = {}
+        for t in tokens:
+            vec[t] = vec.get(t, 0.0) + 1.0
+        norm = sum(v * v for v in vec.values()) ** 0.5 or 1.0
+        return {k: v / norm for k, v in vec.items()}
+
+    def _bow_cosine(self, a: str, b: str) -> float:
+        va, vb = self._bow_vector(a), self._bow_vector(b)
+        return sum(va.get(k, 0.0) * vb.get(k, 0.0) for k in va)
+
+    def similarity(self, a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        if self._backend == "sbert" and self._model is not None:
+            try:
+                from sentence_transformers import util
+                va = self._model.encode(a, convert_to_tensor=True)
+                vb = self._model.encode(b, convert_to_tensor=True)
+                return float(util.cos_sim(va, vb))
+            except Exception:
+                pass
+        return self._bow_cosine(a, b)
+
+_embed = EmbeddingEngine()
+
+
+# ==========================================================
+# CLASSIFIER
+# IMP-4: Non-blocking. Rule-based result is returned immediately.
+#         LLM refine runs in a background thread and updates the
+#         saved entry via callback — the user never waits for it.
+# ==========================================================
+
+_FACT_SIGNALS = (
+    "my name is", "i am", "i'm", "i was born", "i live", "i work",
+    "i studied", "my job", "my age", "i have", "i own",
+)
+_PREFERENCE_SIGNALS = (
+    "i like", "i love", "i enjoy", "i prefer", "i hate", "i dislike",
+    "i always", "i usually", "i never", "my favourite", "my favorite",
+    "i want", "i need",
+)
+_TRIVIAL_SIGNALS = (
+    "hello", "hi", "hey", "ok", "okay", "thanks", "thank you",
+    "bye", "goodbye", "yes", "no", "sure", "alright",
+)
+
+def _classify_memory_rules(text: str) -> MemoryType:
+    n = text.lower().strip()
+    if len(n) <= 15:
+        return MemoryType.TRIVIAL
+    if any(s in n for s in _TRIVIAL_SIGNALS) and len(n) < 40:
+        return MemoryType.TRIVIAL
+    if any(s in n for s in _FACT_SIGNALS):
+        return MemoryType.FACT
+    if any(s in n for s in _PREFERENCE_SIGNALS):
+        return MemoryType.PREFERENCE
+    return MemoryType.CONVERSATION
+
+def _classify_memory(text: str) -> MemoryType:
+    """
+    Always returns immediately using rule-based classification.
+    Fast and good enough for the save path.
+    """
+    return _classify_memory_rules(text)
+
+def _classify_memory_async(text: str, callback) -> None:
+    """
+    IMP-4: Fires a background LLM call for more accurate classification.
+    Calls callback(MemoryType) when done so the caller can update the
+    stored entry — this never blocks the response pipeline.
+    """
+    def _run():
+        prompt = (
+            "Classify the following text as exactly one of: "
+            "fact, preference, conversation, trivial.\n"
+            "Reply with ONE word only.\n\n"
+            f"Text: {text[:200]}"
+        )
+        try:
+            raw    = ai_knowledge.answer_question(prompt, timeout=5)
+            token  = raw.strip().lower().split()[0] if raw else ""
+            result = MemoryType(token)
+        except Exception:
+            result = _classify_memory_rules(text)
+        try:
+            callback(result)
+        except Exception as e:
+            logger.debug("Async classify callback error: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ==========================================================
+# RELATIONSHIP GRAPH
+# ==========================================================
+
+class EdgeType(str, Enum):
+    LIKES      = "likes"
+    DISLIKES   = "dislikes"
+    OWNS       = "owns"
+    WORKS_ON   = "works_on"
+    LIVES_IN   = "lives_in"
+    KNOWS      = "knows"
+    IS_A       = "is_a"
+    RELATED_TO = "related_to"
+
+_EDGE_PATTERNS: List[Tuple[str, EdgeType]] = [
+    (r"\b(like|love|enjoy|prefer)\b",                        EdgeType.LIKES),
+    (r"\b(hate|dislike|don't like|avoid)\b",                 EdgeType.DISLIKES),
+    (r"\b(own|have|bought|using)\b",                         EdgeType.OWNS),
+    (r"\b(work(?:ing)? on|build(?:ing)?|making|creating)\b", EdgeType.WORKS_ON),
+    (r"\b(live|stay|based|located|from)\b",                  EdgeType.LIVES_IN),
+    (r"\b(know|met|friend|colleague)\b",                     EdgeType.KNOWS),
+    (r"\b(is a|are a|am a|type of|kind of)\b",               EdgeType.IS_A),
+]
+
+def _infer_edge_type(text: str) -> EdgeType:
+    n = text.lower()
+    for pattern, edge in _EDGE_PATTERNS:
+        if re.search(pattern, n):
+            return edge
+    return EdgeType.RELATED_TO
+
+
+class RelationshipGraph:
+    """
+    Persistent, edge-typed relationship graph stored as JSON.
+    Edges: subject → {object: {type, weight, updated}}.
+    """
+
+    def __init__(self, path: Path = _GRAPH_PATH) -> None:
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._graph: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self._path.exists():
+                self._graph = json.loads(self._path.read_text())
+        except Exception as e:
+            logger.warning("Graph load failed: %s", e)
+            self._graph = {}
+
+    def _flush(self) -> None:
+        try:
+            self._path.write_text(json.dumps(self._graph, indent=2))
+        except Exception as e:
+            logger.warning("Graph flush failed: %s", e)
+
+    def add_edge(self, user_id: str, subject: str, obj: str,
+                 edge: EdgeType, weight: float = 1.0) -> None:
+        g = self._graph.setdefault(user_id, {})
+        s = g.setdefault(subject, {})
+        if obj in s:
+            s[obj]["weight"] = round(s[obj]["weight"] + weight * 0.5, 3)
+        else:
+            s[obj] = {"type": edge.value, "weight": weight, "updated": time.time()}
+        self._flush()
+
+    def get_neighbours(self, user_id: str, node: str,
+                       min_weight: float = 0.5) -> List[Tuple[str, str, float]]:
+        edges = self._graph.get(user_id, {}).get(node, {})
+        result = [
+            (nb, meta["type"], meta["weight"])
+            for nb, meta in edges.items()
+            if meta["weight"] >= min_weight
+        ]
+        return sorted(result, key=lambda x: x[2], reverse=True)
+
+    def update_from_memory(self, user_id: str, text: str) -> None:
+        entities = list(set(_extract_entity_tokens(text)))
+        if len(entities) < 2:
+            return
+        edge    = _infer_edge_type(text)
+        subject = entities[0]
+        for obj in entities[1:]:
+            if subject != obj:
+                self.add_edge(user_id, subject, obj, edge)
+
+    def relationship_context(self, user_id: str, entities: List[str]) -> str:
+        lines: List[str] = []
+        seen:  Set[str]  = set()
+        for ent in entities[:5]:
+            for nb, etype, _ in self.get_neighbours(user_id, ent)[:2]:
+                key = f"{ent}→{nb}"
+                if key not in seen:
+                    seen.add(key)
+                    lines.append(f"{ent} {etype} {nb}")
+        return "\n".join(lines)
+
+_graph = RelationshipGraph()
+
+
+# ==========================================================
+# ENTITY EXTRACTION
+# ==========================================================
+
+def _extract_entity_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    tokens += [t.lower() for t in re.findall(r'"([^"]+)"', text)]
+    tokens += [t.lower() for t in re.findall(r"\b([A-Z][a-z]{2,})\b", text)]
+    words = set(re.findall(r"\b\w+\b", text.lower()))
+    for abbr in _ABBREV:
+        if abbr in words:
+            tokens.append(abbr)
+            tokens.append(_ABBREV[abbr])
+    if words & _SELF_PRONOUNS:
+        tokens.append("__user__")
+    return [t for t in tokens if len(t) > 2]
+
+def _build_relationship_tags(memories: List[Any]) -> Dict[str, List[str]]:
+    entry_entities: List[Tuple[int, List[str]]] = []
+    for idx, m in enumerate(memories):
+        text = m.get("text", "") if isinstance(m, dict) else str(m)
+        entry_entities.append((idx, _extract_entity_tokens(text)))
+
+    co_map: Dict[str, set] = {}
+    for _, entities in entry_entities:
+        for e in entities:
+            if e not in co_map:
+                co_map[e] = set()
+            co_map[e].update(e2 for e2 in entities if e2 != e)
+
+    relationship_tags: Dict[str, List[str]] = {}
+    for idx, entities in entry_entities:
+        related: set = set()
+        for e in entities:
+            related.update(co_map.get(e, set()))
+        related.discard("__user__")
+        related.discard("")
+        if related:
+            m   = memories[idx]
+            key = m.get("text", str(idx)) if isinstance(m, dict) else str(idx)
+            relationship_tags[key] = sorted(related)
+
+    return relationship_tags
+
+
+# ==========================================================
+# REINFORCEMENT
+# ==========================================================
+
+_CORRECTION_SIGNALS = (
+    "no, that's wrong", "that's incorrect", "you're wrong", "actually",
+    "not quite", "wrong", "incorrect", "mistake",
+    "no that's not right", "that is not",
+)
+
+def _is_correction(user_input: str) -> bool:
+    n = user_input.lower().strip()
+    return any(sig in n for sig in _CORRECTION_SIGNALS)
+
+def _decayed_boost(raw_boost: float, boost_ts: float) -> float:
+    if raw_boost <= 0:
+        return 0.0
+    age_days = (time.time() - boost_ts) / 86_400
+    return raw_boost * (0.5 ** (age_days / _BOOST_HALF_LIFE_DAYS))
+
+def _reinforce_memories(memories: List[Any], query: str, correction: bool) -> List[Any]:
+    query_tokens = set(re.findall(r"\w+", query.lower()))
+    now          = time.time()
+
+    most_recent_conv: Optional[Any] = None
+    most_recent_ts: float = 0.0
+    for m in memories:
+        if not isinstance(m, dict):
+            continue
+        if m.get("type") == MemoryType.CONVERSATION.value:
+            ts = float(m.get("timestamp", 0))
+            if ts > most_recent_ts:
+                most_recent_ts   = ts
+                most_recent_conv = m
+
+    for m in memories:
+        if not isinstance(m, dict):
+            continue
+        text      = str(m.get("text") or m.get("content") or "")
+        tokens    = set(re.findall(r"\w+", text.lower()))
+        raw_boost = float(m.get("score_boost", 0.0))
+        boost_ts  = float(m.get("boost_ts", now))
+
+        if query_tokens and tokens:
+            overlap = len(query_tokens & tokens) / len(query_tokens)
+            if overlap > 0.4:
+                m["score_boost"] = min(_BOOST_MAX, raw_boost + _BOOST_INCREMENT * overlap)
+                m["boost_ts"]    = now
+                m["confidence"]  = min(1.0, float(m.get("confidence", _CONFIDENCE_INIT)) + _CONFIDENCE_CORRECT)
+            m["_eff_boost"] = _decayed_boost(m.get("score_boost", raw_boost), m.get("boost_ts", boost_ts))
+        else:
+            m["_eff_boost"] = _decayed_boost(raw_boost, boost_ts)
+
+        if correction and m is most_recent_conv:
+            m["confidence"]  = max(0.0, float(m.get("confidence", _CONFIDENCE_INIT)) + _CONFIDENCE_WRONG)
+            m["score_boost"] = raw_boost * 0.5
+            m["boost_ts"]    = now
+            m["_eff_boost"]  = _decayed_boost(m["score_boost"], now)
+            logger.debug("Correction applied to: %r", text[:60])
+
+    return memories
+
+
+# ==========================================================
+# CONTRADICTION DETECTION
+# ==========================================================
+
+def _detect_contradiction(new_text: str, existing_facts: List[Any]) -> Optional[Any]:
+    for m in existing_facts:
+        if not isinstance(m, dict):
+            continue
+        if m.get("type") != MemoryType.FACT.value:
+            continue
+        existing_text = str(m.get("text", ""))
+        if _embed.similarity(new_text, existing_text) < _CONTRADICT_THRESHOLD:
+            continue
+        prompt = (
+            "Do these two statements contradict each other? "
+            "Reply with YES or NO only.\n\n"
+            f"Statement 1: {existing_text[:200]}\n"
+            f"Statement 2: {new_text[:200]}"
+        )
+        try:
+            answer = ai_knowledge.answer_question(prompt, timeout=5)
+            if answer and "yes" in answer.strip().lower():
+                return m
+        except Exception:
+            pass
+    return None
+
+def _resolve_contradiction(memory: MemoryManager, user_id: str,
+                           new_entry: Dict[str, Any], old_entry: Dict[str, Any]) -> None:
+    old_text = old_entry.get("text", "")
+    new_text = new_entry.get("text", "")
+    new_hash = hashlib.md5(new_text.encode()).hexdigest()[:8]
+
+    versioned = {
+        "text": old_text, "type": "fact_superseded",
+        "timestamp": old_entry.get("timestamp", time.time()),
+        "superseded_by": new_hash, "confidence": 0.1,
+    }
+    try:
+        memory.delete(user_id, old_text)
+        memory.save(user_id, versioned)
+        memory.save(user_id, new_entry)
+        logger.debug("Contradiction resolved: %r → %r", old_text[:60], new_text[:60])
+    except AttributeError:
+        logger.warning("memory.delete() not implemented — saving new fact alongside old.")
+        try:
+            memory.save(user_id, new_entry)
+        except Exception as e:
+            logger.warning("Contradiction save fallback failed: %s", e)
+    except Exception as e:
+        logger.warning("Contradiction resolution failed: %s", e)
+
+
+# ==========================================================
+# STEP ROUTER
+# ==========================================================
+
+def _extract_name(text: str) -> str:
+    m = re.search(r"\b([A-Z][a-z]{2,})\b", text)
+    return m.group(1) if m else ""
+
+def _route_step(step: str, ctx: Dict, user_id: str, ai_fn: Any) -> str:
+    n     = step.lower()
+    state = ctx.setdefault("plan_state", {})
+
+    if any(k in n for k in ("send message", "send a message", "message to")):
+        contact = state.get("contact") or _extract_name(step)
+        message = state.get("message", step)
+        if contact:
+            return _normalize_tool_result(
+                messaging_service.send(contact=contact, message=message)
+            ) or f"Message sent to {contact}."
+
+    if any(k in n for k in ("call ", "make a call", "phone")):
+        contact = state.get("contact") or _extract_name(step)
+        if contact:
+            return _normalize_tool_result(
+                messaging_service.call(contact=contact)
+            ) or f"Calling {contact}."
+
+    if "open " in n:
+        app = re.sub(r"open\s+", "", n).strip()
+        return _normalize_tool_result(system_controller.open_app(app)) or f"Opening {app}."
+
+    if "close " in n:
+        app = re.sub(r"close\s+", "", n).strip()
+        return _normalize_tool_result(system_controller.close_app(app)) or f"Closed {app}."
+
+    if any(k in n for k in ("search for", "look up", "google")):
+        query = re.sub(r"(search for|look up|google)\s*", "", n).strip()
+        return _normalize_tool_result(web_controller.search(query)) or f"Searched for {query}."
+
+    if "screenshot" in n:
+        return _normalize_tool_result(system_controller.take_screenshot()) or "Screenshot taken."
+
+    if any(k in n for k in ("set reminder", "remind me")):
+        rm = ctx.get("reminder_manager")
+        if rm:
+            return _normalize_tool_result(
+                rm.set(step, state.get("time", ""))
+            ) or "Reminder set."
+
+    if "weather" in n:
+        return _normalize_tool_result(
+            utility_manager.get_weather(state.get("location", ""))
+        ) or "Fetching weather."
+
+    if "time" in n:
+        return _normalize_tool_result(utility_manager.get_time()) or "Fetching time."
+
+    if "date" in n:
+        return _normalize_tool_result(utility_manager.get_date()) or "Fetching date."
+
+    return ai_fn(step, ctx, user_id)
+
+
+# ==========================================================
+# REASONING LAYER
+# ==========================================================
+
+class GoalStatus(str, Enum):
+    PENDING = "pending"
+    ACTIVE  = "active"
+    DONE    = "done"
+    FAILED  = "failed"
+
+class ReasoningLayer:
+    """
+    Goal-tracking reasoning: plan → execute → reflect.
+    Each step is routed through _route_step() which attempts real tool
+    execution before falling back to the LLM. Steps share state via
+    ctx["plan_state"]. Execution halts on user interrupt or timeout.
+    Failed steps trigger a lightweight re-plan for remaining steps.
+    """
+
+    def __init__(self) -> None:
+        self.goals: List[Dict[str, Any]] = []
+
+    def _should_reason(self, text: str) -> bool:
+        triggers = (
+            "help me", "i want to", "i need to", "can you plan",
+            "set up", "organise", "make a plan", "step by step",
+            "first", "then", "after that", "finally",
+        )
+        return any(t in text.lower() for t in triggers) and len(text) > 40
+
+    def _generate_plan(self, goal: str, context_hint: str = "") -> List[str]:
+        prompt = (
+            f"Break this goal into at most {_GOAL_MAX_STEPS} clear, "
+            "short action steps. Return ONLY a JSON array of strings.\n"
+            f"{('Context: ' + context_hint) if context_hint else ''}\n\n"
+            f"Goal: {goal}"
+        )
+        try:
+            raw   = ai_knowledge.answer_question(prompt, timeout=8)
+            clean = re.sub(r"```[a-z]*|```", "", raw or "").strip()
+            steps = json.loads(clean)
+            if isinstance(steps, list):
+                return [str(s) for s in steps[:_GOAL_MAX_STEPS]]
+        except Exception as e:
+            logger.warning("Plan generation failed: %s", e)
+        return []
+
+    def _replan(self, goal: str, failed_step: str, remaining: List[str]) -> List[str]:
+        hint = f"Step '{failed_step}' failed. Remaining steps were: {remaining}"
+        return self._generate_plan(goal, context_hint=hint)
+
+    def _reflect(self, goal: str, results: List[str]) -> str:
+        results_text = "\n".join(f"- {r}" for r in results)
+        prompt = (
+            f"Goal: {goal}\n\nResults:\n{results_text}\n\n"
+            "In one sentence: was the goal achieved? If not, what is missing?"
+        )
+        try:
+            return ai_knowledge.answer_question(prompt, timeout=6) or ""
+        except Exception:
+            return ""
+
+    def run(self, goal: str, ctx: Dict, user_id: str, ai_fn: Any) -> str:
+        if not self._should_reason(goal):
+            return ai_fn(goal, ctx, user_id)
+
+        steps = self._generate_plan(goal)
+        if not steps:
+            return ai_fn(goal, ctx, user_id)
+
+        ctx.setdefault("plan_state", {})
+
+        goal_record: Dict[str, Any] = {
+            "goal": goal, "steps": steps,
+            "status": GoalStatus.ACTIVE.value, "results": [], "ts": time.time(),
+        }
+        self.goals.append(goal_record)
+
+        results:    List[str] = []
+        start_time: float     = time.time()
+        step_idx:   int       = 0
+
+        while step_idx < len(steps):
+            if ctx.get("interrupt"):
+                logger.info("Reasoning interrupted by user.")
+                goal_record["status"] = GoalStatus.FAILED.value
+                break
+
+            if time.time() - start_time > _PLAN_TIMEOUT_SECS:
+                logger.warning("Reasoning timeout after %.1fs.", time.time() - start_time)
+                results.append("(plan timed out)")
+                break
+
+            step = steps[step_idx]
+            try:
+                result = _route_step(step, ctx, user_id, ai_fn)
+                results.append(result)
+                goal_record["results"].append(result)
+
+                if any(sig in result.lower() for sig in _FAILURE_SIGNALS):
+                    logger.warning("Step failed: %r → %r", step, result[:80])
+                    remaining = steps[step_idx + 1:]
+                    if remaining:
+                        revised = self._replan(goal, step, remaining)
+                        if revised:
+                            steps = steps[:step_idx + 1] + revised
+                            logger.info("Replanned: %d new steps.", len(revised))
+
+            except Exception as e:
+                err = f"Step error: {e}"
+                results.append(err)
+                goal_record["results"].append(err)
+                logger.warning("Step exception: %s", e)
+
+            step_idx += 1
+
+        reflection                = self._reflect(goal, results)
+        goal_record["status"]     = GoalStatus.DONE.value
+        goal_record["reflection"] = reflection
+
+        combined = "\n".join(results)
+        if reflection:
+            combined += f"\n\n{reflection}"
+        return combined
+
+_reasoner = ReasoningLayer()
+
+
+# ==========================================================
+# MMR
+# ==========================================================
+
+def _mmr_select(candidates: List[Any], scores: Dict[int, float],
+                k: int, lmbda: float) -> List[Any]:
+    if not candidates:
+        return []
+    selected:       List[Any] = []
+    selected_texts: List[str] = []
+    remaining = list(range(len(candidates)))
+
+    for _ in range(min(k, len(candidates))):
+        best_idx = -1
+        best_mmr = float("-inf")
+        for i in remaining:
+            relevance  = scores.get(i, 0.0)
+            text_i     = candidates[i].get("text", "") if isinstance(candidates[i], dict) else str(candidates[i])
+            redundancy = (
+                max(_embed.similarity(text_i, t) for t in selected_texts)
+                if selected_texts else 0.0
+            )
+            mmr = lmbda * relevance - (1 - lmbda) * redundancy
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+        if best_idx == -1:
+            break
+        selected.append(candidates[best_idx])
+        text_sel = (
+            candidates[best_idx].get("text", "")
+            if isinstance(candidates[best_idx], dict)
+            else str(candidates[best_idx])
+        )
+        selected_texts.append(text_sel)
+        remaining.remove(best_idx)
+
+    return selected
+
+
+# ==========================================================
+# MEMORY COMPRESSION
+# BUG-4 FIX: also add newer.get("text") to processed so it is
+#             not deleted during the merge step that follows.
+# ==========================================================
+
+def _compress_memories(memory: MemoryManager, user_id: str) -> None:
+    cutoff = time.time() - _COMPRESS_AGE_DAYS * 86_400
+
+    try:
+        all_facts: List[Any] = memory.search(
+            user_id, "", limit=50, filter_type=MemoryType.FACT.value
+        )
+    except TypeError:
+        try:
+            all_facts = [
+                m for m in memory.search(user_id, "", limit=50)
+                if isinstance(m, dict) and m.get("type") == MemoryType.FACT.value
+            ]
+        except Exception as e:
+            logger.warning("Compression fetch failed: %s", e)
+            return
+    except Exception as e:
+        logger.warning("Compression fetch failed: %s", e)
+        return
+
+    stale = [
+        m for m in all_facts
+        if isinstance(m, dict) and float(m.get("timestamp", time.time())) < cutoff
+    ]
+
+    if len(stale) < _COMPRESS_MIN_ENTRIES:
+        return
+
+    processed: Set[str] = set()
+    for i, m_a in enumerate(stale):
+        for m_b in stale[i + 1:]:
+            ta, tb = m_a.get("text", ""), m_b.get("text", "")
+            if ta in processed or tb in processed:
+                continue
+            if _embed.similarity(ta, tb) >= _CONTRADICT_THRESHOLD:
+                older, newer = (
+                    (m_a, m_b)
+                    if float(m_a.get("timestamp", 0)) < float(m_b.get("timestamp", 0))
+                    else (m_b, m_a)
+                )
+                _resolve_contradiction(memory, user_id, newer, older)
+                processed.add(older.get("text", ""))
+                # BUG-4 FIX: mark newer as processed so the merge step
+                # below does not include it in the LLM prompt and then
+                # delete it — it was just saved by _resolve_contradiction.
+                processed.add(newer.get("text", ""))
+
+    stale = [m for m in stale if m.get("text", "") not in processed]
+    if len(stale) < _COMPRESS_MIN_ENTRIES:
+        return
+
+    raw_texts   = [m.get("text", "") for m in stale if m.get("text")]
+    joined      = "\n".join(f"- {t}" for t in raw_texts)
+    source_hash = hashlib.md5(joined.encode()).hexdigest()[:12]
+
+    prompt = (
+        "Merge the following user facts into ONE concise summary sentence.\n"
+        "If any contradict, keep only the most recent-sounding one.\n"
+        "Reply with the summary sentence only.\n\n"
+        f"{joined}"
+    )
+    try:
+        summary = ai_knowledge.answer_question(prompt, timeout=10)
+    except Exception as e:
+        logger.warning("Compression LLM failed: %s", e)
+        return
+
+    if not summary or not isinstance(summary, str) or len(summary.strip()) < 10:
+        return
+
+    try:
+        for m in stale:
+            memory.delete(user_id, m.get("text", ""))
+    except AttributeError:
+        logger.warning("memory.delete() not implemented — compression aborted.")
+        return
+    except Exception as e:
+        logger.warning("Compression delete failed: %s", e)
+        return
+
+    try:
+        memory.save(user_id, {
+            "text"            : f"[Merged fact] {summary.strip()}",
+            "type"            : MemoryType.FACT.value,
+            "timestamp"       : time.time(),
+            "compressed_from" : source_hash,
+            "confidence"      : 0.85,
+        })
+        logger.debug("Compressed %d facts → %r", len(stale), summary[:80])
+    except Exception as e:
+        logger.warning("Compression save failed: %s", e)
+
+
+# ==========================================================
+# SCHEMA GUARD
+# ==========================================================
+
+def _memory_text_matches_schema(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    text = entry.get("text")
+    if not text or not isinstance(text, str) or not text.strip():
+        return False
+    if not isinstance(entry.get("type"), str):
+        return False
+    ts = entry.get("timestamp")
+    if not isinstance(ts, (int, float)):
+        return False
+    return True
+
+
+# ==========================================================
+# TRIM HELPER
+# ==========================================================
+
+def _trim_to_budget(text: str, budget: int) -> str:
+    if len(text) <= budget:
+        return text
+    lines     = text.split("\n")
+    new_block = ""
+    for line in lines:
+        if len(new_block) + len(line) + 1 > budget:
+            remaining = budget - len(new_block)
+            if remaining > 20:
+                partial    = line[:remaining]
+                last_space = partial.rfind(" ")
+                if last_space > 20:
+                    partial = partial[:last_space]
+                new_block += partial
+            break
+        new_block += line + "\n"
+    return new_block
+
+
+# ==========================================================
+# BUG-2: _looks_like_phone — now wired into awaiting_contact
+# ==========================================================
+
+def _looks_like_phone(text: str) -> bool:
+    digits     = re.sub(r"[^\d]", "", text)
+    word_count = len(text.strip().split())
+    return len(digits) >= 7 and word_count <= 3
+
+
+# ==========================================================
+# IMP-8: MEMORY INTERFACE GUARD
+# Warns at startup about any missing MemoryManager methods
+# instead of silently failing mid-conversation.
+# ==========================================================
+
+_REQUIRED_MEMORY_METHODS = ("search", "save", "get_profile",
+                             "set_profile_value", "exists", "delete",
+                             "update", "prune", "count")
+
+def _check_memory_interface(memory: MemoryManager) -> None:
+    missing = [m for m in _REQUIRED_MEMORY_METHODS if not callable(getattr(memory, m, None))]
+    if missing:
+        logger.warning(
+            "MemoryManager is missing methods: %s. "
+            "Some features will fall back to safe defaults but may behave differently.",
+            ", ".join(missing),
+        )
+
+
+# ==========================================================
+# COMMAND EXECUTOR
+# ==========================================================
 
 class CommandExecutor:
 
     def __init__(self):
         self.memory = MemoryManager("data/memory.db")
+
+        # IMP-8: check interface at startup
+        _check_memory_interface(self.memory)
 
         self.context: Dict[str, Any] = {
             "history":          [],
@@ -48,23 +1100,388 @@ class CommandExecutor:
             "reminder_manager": None,
             "awaiting_contact": None,
             "profile_loaded":   False,
+            "interrupt":        False,
+            "plan_state":       {},
+            # IMP-5: onboarding state
+            "onboarding_complete": False,
+            "onboarding_step":     0,
+            "onboarding_data":     {},
+            # IMP-6: session tracking
+            "session_start_ts":    time.time(),
+            "nudge_sent":          False,
         }
 
         self._load_profile()
 
-    # ==================================================================
+    # ==========================================================
+    # MEMORY SCORE
+    # IMP-3: uses _embed.embed_weight which returns 0.0 when BoW
+    #         is the active backend, preventing double-counting.
+    # ==========================================================
+
+    @staticmethod
+    def _memory_score(memory_item: Any, query: str) -> float:
+        """
+        Score = (0.6 * recency + 0.4 * hybrid_sim) * type_weight * confidence
+                + decayed_boost
+        hybrid_sim = embed_weight * embed_sim + (1 - embed_weight) * token_sim
+        When BoW backend is active, embed_weight = 0.0 so only token_sim is used.
+        fact_superseded always returns 0.05.
+        """
+        text       = ""
+        ts         = None
+        mem_type   = MemoryType.CONVERSATION
+        raw_boost  = 0.0
+        boost_ts   = time.time()
+        confidence = _CONFIDENCE_INIT
+
+        if isinstance(memory_item, dict):
+            text       = str(memory_item.get("text") or memory_item.get("content") or "")
+            ts         = memory_item.get("timestamp") or memory_item.get("ts")
+            raw_boost  = float(memory_item.get("score_boost", 0.0))
+            boost_ts   = float(memory_item.get("boost_ts", time.time()))
+            confidence = float(memory_item.get("confidence", _CONFIDENCE_INIT))
+            raw_type   = memory_item.get("type", "conversation")
+            if raw_type == "fact_superseded":
+                return 0.05
+            try:
+                mem_type = MemoryType(raw_type)
+            except ValueError:
+                pass
+        else:
+            text = str(memory_item)
+
+        decay_days = _TYPE_DECAY_DAYS[mem_type]
+        if ts is not None:
+            try:
+                age_days = (time.time() - float(ts)) / 86_400
+                recency  = max(0.0, 1.0 - (age_days / decay_days))
+            except (TypeError, ValueError):
+                recency  = 0.5
+        else:
+            recency = 0.5
+
+        ew        = _embed.embed_weight          # IMP-3: 0.0 when BoW
+        embed_sim = _embed.similarity(query, text) if ew > 0 else 0.0
+        query_tok = set(re.findall(r"\w+", query.lower()))
+        mem_tok   = set(re.findall(r"\w+", text.lower()))
+        token_sim = len(query_tok & mem_tok) / len(query_tok) if query_tok else 0.0
+        combined  = ew * embed_sim + (1 - ew) * token_sim
+
+        base = (0.6 * recency + 0.4 * combined) * _TYPE_WEIGHT[mem_type]
+        return base * confidence + _decayed_boost(raw_boost, boost_ts)
+
+    # ==========================================================
+    # PRUNE PROBABILITY
+    # ==========================================================
+
+    def _prune_probability(self, user_id: str, ctx: Dict) -> int:
+        try:
+            memory_size = self.memory.count(user_id)
+            ratio = memory_size / max(_MEMORY_MAX_ITEMS, 1)
+            prob  = _PRUNE_PROB_MAX - ratio * (_PRUNE_PROB_MAX - _PRUNE_PROB_MIN)
+            return max(_PRUNE_PROB_MIN, min(_PRUNE_PROB_MAX, int(prob)))
+        except Exception:
+            history_len = len(ctx.get("history", []))
+            return min(_PRUNE_PROB_MAX, max(_PRUNE_PROB_MIN, history_len // 2 or _PRUNE_PROB_MAX))
+
+    # ==========================================================
+    # CONTEXT BLOCK BUILDER
+    # ==========================================================
+
+    def _build_context_block(self, memories: List[Any], profile: Dict,
+                              history_turns: List[Dict], query: str,
+                              context_budget: int, user_id: str) -> str:
+        longterm_budget  = int(context_budget * _LONGTERM_BUDGET_RATIO)
+        shortterm_budget = context_budget - longterm_budget
+
+        longterm_types  = {MemoryType.FACT, MemoryType.PREFERENCE}
+        shortterm_types = {MemoryType.CONVERSATION, MemoryType.TRIVIAL}
+
+        def mem_type_of(m: Any) -> MemoryType:
+            if not isinstance(m, dict):
+                return MemoryType.CONVERSATION
+            try:
+                return MemoryType(m.get("type", "conversation"))
+            except ValueError:
+                return MemoryType.CONVERSATION
+
+        lt_candidates = [m for m in memories if mem_type_of(m) in longterm_types]
+        st_candidates = [m for m in memories if mem_type_of(m) in shortterm_types]
+        lt_scores     = {i: self._memory_score(m, query) for i, m in enumerate(lt_candidates)}
+        st_scores     = {i: self._memory_score(m, query) for i, m in enumerate(st_candidates)}
+        longterm      = _mmr_select(lt_candidates, lt_scores, _MEMORY_TOP_K, _MMR_LAMBDA)
+        shortterm     = _mmr_select(st_candidates, st_scores, _MEMORY_TOP_K, _MMR_LAMBDA)
+
+        rel_tags      = _build_relationship_tags(longterm + shortterm)
+        all_entities: List[str] = []
+        for m in longterm + shortterm:
+            all_entities += _extract_entity_tokens(
+                m.get("text", "") if isinstance(m, dict) else str(m)
+            )
+        graph_context = _graph.relationship_context(user_id, list(set(all_entities)))
+
+        def render(m: Any) -> str:
+            raw  = m.get("text") or m.get("content") or str(m) if isinstance(m, dict) else str(m)
+            line = str(raw)[:_MEMORY_LINE_MAX_CHARS]
+            tags = rel_tags.get(raw if isinstance(m, dict) else str(m), [])
+            if tags:
+                line += f"  (related: {', '.join(tags[:3])})"
+            return f"- {line}\n"
+
+        block = ""
+
+        if longterm:
+            section = "What I know about you:\n"
+            for m in longterm:
+                section += render(m)
+            block += _trim_to_budget(section, longterm_budget)
+
+        if shortterm:
+            section   = "\nRecent context:\n"
+            for m in shortterm:
+                section += render(m)
+            remaining = shortterm_budget - len(block)
+            if remaining > 50:
+                block += _trim_to_budget(section, remaining)
+
+        if graph_context:
+            block += f"\nKnown relationships:\n{graph_context}\n"
+
+        block += (
+            f"\nUser language: {profile.get('language', 'en')}"
+            f"\nConversation mode: {profile.get('mode', 'neutral')}\n"
+        )
+
+        if history_turns:
+            block += "\nRecent conversation:\n"
+            for turn in history_turns:
+                role    = turn.get("role", "user").capitalize()
+                snippet = str(turn.get("text", ""))[:_HISTORY_TEXT_MAX]
+                block  += f"{role}: {snippet}\n"
+
+        return block
+
+    # ==========================================================
+    # MEMORY-AWARE AI
+    # ==========================================================
+
+    def _ai_with_memory(self, user_input: str, ctx: Dict, user_id: str,
+                         allow_reasoning: bool = True,
+                         is_internal: bool = False) -> str:
+
+        # Step 1 — fetch
+        try:
+            memories: List = self.memory.search(user_id, user_input, limit=_MEMORY_FETCH_LIMIT)
+        except Exception as e:
+            logger.warning("Memory search failed: %s", e)
+            memories = []
+
+        try:
+            profile: Dict = self.memory.get_profile(user_id) or {}
+        except Exception as e:
+            logger.warning("Profile fetch failed: %s", e)
+            profile = {}
+
+        # Step 2 — sanitise + correction detection
+        safe_input = user_input.replace("\n", " ").strip()
+        correction = _is_correction(safe_input)
+
+        # Step 3 — reinforcement
+        if memories:
+            memories = _reinforce_memories(memories, safe_input, correction)
+
+        # Step 4 — build prompt using Master System Prompt (IMP-1)
+        system_header  = _RADHE_SYSTEM_PROMPT + "\n"
+        user_footer    = f"\nUser: {safe_input}\n\nRespond naturally, using memory when relevant."
+        context_budget = _PROMPT_HARD_LIMIT - len(system_header) - len(user_footer)
+        history_turns: List[Dict] = ctx.get("history", [])[-_HISTORY_TURNS:]
+
+        if context_budget < 100:
+            logger.warning("Prompt budget too small; context dropped.")
+            context_block = ""
+        else:
+            context_block = self._build_context_block(
+                memories=memories, profile=profile, history_turns=history_turns,
+                query=safe_input, context_budget=context_budget, user_id=user_id,
+            )
+            if len(context_block) > context_budget:
+                context_block = _trim_to_budget(context_block, context_budget)
+
+        final_prompt = system_header + context_block + user_footer
+        if not final_prompt.strip():
+            final_prompt = f"User: {safe_input}"
+
+        logger.debug("Final prompt (%d chars): %s", len(final_prompt), final_prompt[:500])
+
+        # Step 5 — LLM call
+        response: Optional[str] = None
+        try:
+            if allow_reasoning:
+                response = _reasoner.run(safe_input, ctx, user_id, self._ai_direct)
+            else:
+                response = ai_knowledge.answer_question(
+                    final_prompt, history=[], timeout=_LLM_TIMEOUT,
+                    language=ctx.get("language", "en"), mode=ctx.get("mode", "neutral"),
+                )
+        except Exception as e:
+            logger.error("LLM call failed (%s): %s", type(e).__name__, e)
+            try:
+                response = self._ai_fallback(user_input, ctx)
+            except Exception as fe:
+                logger.error("Fallback failed: %s", fe)
+
+        # Step 6 — normalise response type
+        if isinstance(response, dict):
+            response = response.get("text", "")
+        elif response is None:
+            response = ""
+        else:
+            response = str(response)
+
+        if not response or len(response.strip()) <= 5:
+            logger.warning("Response validation failed. Got: %r", response)
+            return self._lang(
+                "I couldn't generate a response. Please try again.",
+                "Jawab nahi aa saka. Dobara try karo.",
+            )
+
+        # Step 7 — save (skipped for internal plan steps)
+        if not is_internal:
+            now    = time.time()
+            u_text = f"User: {safe_input}"
+            a_text = f"Assistant: {response}"
+            u_type = _classify_memory(safe_input)
+            u_entry = {
+                "text": u_text, "type": u_type.value,
+                "timestamp": now, "confidence": _CONFIDENCE_INIT,
+            }
+            a_entry = {
+                "text": a_text, "type": MemoryType.CONVERSATION.value,
+                "timestamp": now, "confidence": _CONFIDENCE_INIT,
+            }
+
+            # IMP-4: async refine of u_entry type (non-blocking)
+            def _update_type(refined: MemoryType):
+                if refined != u_type:
+                    try:
+                        self.memory.update(user_id, u_text, {"type": refined.value})
+                    except Exception:
+                        pass
+            if len(safe_input.strip()) >= _CLASSIFIER_SHORT_LIMIT:
+                _classify_memory_async(safe_input, _update_type)
+
+            try:
+                if u_type == MemoryType.FACT:
+                    contradicting = _detect_contradiction(u_text, memories)
+                    if contradicting:
+                        _resolve_contradiction(self.memory, user_id, u_entry, contradicting)
+                    elif not self.memory.exists(user_id, u_text):
+                        self.memory.save(user_id, u_entry)
+                else:
+                    if _memory_text_matches_schema(u_entry) and not self.memory.exists(user_id, u_text):
+                        self.memory.save(user_id, u_entry)
+
+                if _memory_text_matches_schema(a_entry) and not self.memory.exists(user_id, a_text):
+                    self.memory.save(user_id, a_entry)
+
+                for m in memories:
+                    if isinstance(m, dict) and "score_boost" in m and m.get("text"):
+                        try:
+                            self.memory.update(user_id, m["text"], {
+                                "score_boost": m["score_boost"],
+                                "boost_ts":    m.get("boost_ts", now),
+                                "confidence":  m.get("confidence", _CONFIDENCE_INIT),
+                            })
+                        except Exception:
+                            pass
+
+                _graph.update_from_memory(user_id, u_text)
+
+            except AttributeError:
+                logger.warning("memory.exists() not implemented — saving without dedup.")
+                try:
+                    self.memory.save(user_id, u_entry)
+                    self.memory.save(user_id, a_entry)
+                except Exception as e:
+                    logger.warning("Memory save failed: %s", e)
+            except Exception as e:
+                logger.warning("Memory save failed: %s", e)
+
+        # Step 8 — prune
+        if random.randint(1, self._prune_probability(user_id, ctx)) == 1:
+            try:
+                self.memory.prune(
+                    user_id, max_items=_MEMORY_MAX_ITEMS,
+                    priority_field="type",
+                    priority_order=[t.value for t in sorted(
+                        MemoryType, key=lambda t: _TYPE_PRUNE_PRIORITY[t]
+                    )],
+                )
+            except TypeError:
+                try:
+                    self.memory.prune(user_id, max_items=_MEMORY_MAX_ITEMS)
+                except Exception as e:
+                    logger.warning("Prune failed: %s", e)
+            except AttributeError:
+                logger.debug("memory.prune() not implemented.")
+            except Exception as e:
+                logger.warning("Prune failed: %s", e)
+
+        # Step 9 — stochastic compression
+        if random.randint(1, _COMPRESS_INTERVAL_PROB) == 1:
+            try:
+                _compress_memories(self.memory, user_id)
+            except Exception as e:
+                logger.warning("Compression failed: %s", e)
+
+        return response
+
+    # BUG-1 FIX: _ai_direct does NOT call the full memory pipeline.
+    # It assembles only the system prompt + raw text and calls the LLM
+    # directly. This avoids a redundant DB fetch on every plan step.
+    def _ai_direct(self, text: str, ctx: Dict, user_id: str) -> str:
+        """
+        Lightweight LLM call used by ReasoningLayer for plan steps.
+        allow_reasoning=False prevents recursion.
+        is_internal=True prevents plan steps from polluting long-term memory.
+        Only assembles a minimal prompt — skips the full memory fetch
+        that _ai_with_memory would do (performance fix for BUG-1).
+        """
+        safe_text    = text.replace("\n", " ").strip()
+        minimal_prompt = (
+            _RADHE_SYSTEM_PROMPT + "\n"
+            f"\nUser: {safe_text}\n\n"
+            "Respond naturally and concisely."
+        )
+        try:
+            response = ai_knowledge.answer_question(
+                minimal_prompt, history=[], timeout=_LLM_TIMEOUT,
+                language=ctx.get("language", "en"), mode=ctx.get("mode", "neutral"),
+            )
+            if isinstance(response, dict):
+                response = response.get("text", "")
+            return str(response or "")
+        except Exception as e:
+            logger.warning("_ai_direct LLM failed: %s", e)
+            return self._ai_fallback(text, ctx)
+
+    # ==========================================================
     # PROFILE
-    # ==================================================================
+    # ==========================================================
 
     def _load_profile(self, user_id: str = "default") -> None:
         try:
             profile = self.memory.get_profile(user_id=user_id) or {}
-            lang = profile.get("language", "en")
-            mode = profile.get("mode",     "neutral")
+            lang    = profile.get("language", "en")
+            mode    = profile.get("mode",     "neutral")
             if lang in ("en", "hi", "mixed"):
                 self.context["language"] = lang
             if mode in ("neutral", "casual", "formal"):
                 self.context["mode"] = mode
+            # restore onboarding state
+            if profile.get("onboarding_complete"):
+                self.context["onboarding_complete"] = True
         except Exception as e:
             logger.warning("Profile load failed: %s", e)
         finally:
@@ -74,439 +1491,455 @@ class CommandExecutor:
         try:
             self.memory.set_profile_value("language", self.context["language"], user_id)
             self.memory.set_profile_value("mode",     self.context["mode"],     user_id)
+            self.memory.set_profile_value(
+                "onboarding_complete",
+                self.context.get("onboarding_complete", False),
+                user_id,
+            )
         except Exception:
             pass
 
-    # ==================================================================
+    # ==========================================================
     # HISTORY
-    # ==================================================================
+    # ==========================================================
 
     def _log(self, role: str, text: str) -> None:
-        self.context["history"].append({
-            "role": role,
-            "text": text,
-            "time": time.time()
-        })
+        self.context["history"].append({"role": role, "text": text, "time": time.time()})
         self.context["history"] = self.context["history"][-MAX_HISTORY:]
 
-    # ==================================================================
+    # ==========================================================
     # HELPERS
-    # ==================================================================
+    # ==========================================================
 
     def _resp(self, text: str) -> Dict[str, Any]:
         text = (text or "Something went wrong.").strip()
         self._log("assistant", text)
         return {"text": text, "voice": text}
 
-    def _lang(self, en: str, hi: str = "") -> str:
+    def _lang(self, en: str, hi: str = "", mixed: str = "") -> str:
         lang = self.context.get("language", "en")
-        if lang == "hi"    and hi: return hi
-        if lang == "mixed" and hi: return f"{hi} ({en})"
+        if lang == "hi"    and hi:    return hi
+        if lang == "mixed" and mixed: return mixed
+        if lang == "mixed" and hi:    return f"{hi} ({en})"
         return en
 
-    def _ai(self, text: str, ctx: Dict) -> str:
-        """Call ai_knowledge with full context. Falls back gracefully."""
+    def _ai_fallback(self, text: str, ctx: Dict) -> str:
+        """Emergency LLM call with no memory. Never call from normal routing."""
         try:
             return ai_knowledge.answer_question(
-                text,
-                history  = ctx.get("history",  []),
-                language = ctx.get("language", "en"),
-                mode     = ctx.get("mode",     "neutral")
+                text, history=ctx.get("history", []),
+                language=ctx.get("language", "en"),
+                mode=ctx.get("mode", "neutral"), timeout=_LLM_TIMEOUT,
             )
         except TypeError:
             return ai_knowledge.answer_question(text)
 
-    # ==================================================================
-    # EXECUTE  (public entry point)
-    # ==================================================================
+    def _ai(self, text: str, ctx: Dict) -> str:
+        """Backward-compatibility alias for _ai_fallback()."""
+        return self._ai_fallback(text, ctx)
 
-    def execute(
-        self,
-        parsed:   Dict[str, Any],
-        text:     str,
-        context:  Optional[Dict[str, Any]] = None,
-        user_id:  str = "default"
-    ) -> Dict[str, Any]:
+    # ==========================================================
+    # IMP-5: ONBOARDING HANDLER  (Build Plan Section 1.6)
+    # Runs first-time setup questions. After completion, sets
+    # language, mode, and saves name/context to memory.
+    # ==========================================================
+
+    def _handle_onboarding(self, text: str, ctx: Dict,
+                            user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns a response dict if we are still in onboarding, else None.
+        """
+        if ctx.get("onboarding_complete"):
+            return None
+
+        step = ctx.get("onboarding_step", 0)
+        data = ctx.setdefault("onboarding_data", {})
+
+        # Step 0: ask for name
+        if step == 0:
+            ctx["onboarding_step"] = 1
+            return self._resp(_ONBOARDING_QUESTIONS[0]["prompt"])
+
+        # Step 1: receive name, ask context
+        if step == 1:
+            data["name"] = text.strip().split()[0].capitalize()
+            ctx["onboarding_step"] = 2
+            prompt = _ONBOARDING_QUESTIONS[1]["prompt"].format(name=data["name"])
+            return self._resp(prompt)
+
+        # Step 2: receive context (student/working/other), ask language
+        if step == 2:
+            raw = text.strip().lower()
+            if "student" in raw:
+                data["context"] = "student"
+                ctx["mode"]     = "casual"
+            elif "work" in raw:
+                data["context"] = "professional"
+                ctx["mode"]     = "neutral"
+            else:
+                data["context"] = "general"
+            ctx["onboarding_step"] = 3
+            return self._resp(_ONBOARDING_QUESTIONS[2]["prompt"])
+
+        # Step 3: receive language preference, complete onboarding
+        if step == 3:
+            raw   = text.strip().lower()
+            lang  = _LANGUAGE_MAP.get(raw, "mixed")
+            ctx["language"] = lang
+
+            # persist everything
+            name    = data.get("name", "")
+            context = data.get("context", "general")
+            now     = time.time()
+            if name:
+                try:
+                    self.memory.save(user_id, {
+                        "text": f"User's name is {name}",
+                        "type": MemoryType.FACT.value,
+                        "timestamp": now, "confidence": 1.0,
+                    })
+                    self.memory.save(user_id, {
+                        "text": f"User is a {context}",
+                        "type": MemoryType.FACT.value,
+                        "timestamp": now, "confidence": 1.0,
+                    })
+                except Exception as e:
+                    logger.warning("Onboarding memory save failed: %s", e)
+
+            ctx["onboarding_complete"] = True
+            ctx["onboarding_step"]     = 0
+            self._save_profile(user_id)
+
+            greeting = self._lang(
+                f"Perfect, {name}! I'm all set. Talk to me about anything — "
+                "I'll remember what matters. What's on your mind?",
+                f"Bilkul, {name}! Main ready hoon. Kuch bhi bolo — "
+                "main yaad rakhta hoon. Kya chal raha hai?",
+                f"Perfect, {name}! Main ready hoon. What's on your mind?",
+            )
+            return self._resp(greeting)
+
+        # Safety fallback: mark complete and move on
+        ctx["onboarding_complete"] = True
+        return None
+
+    # ==========================================================
+    # IMP-6: SESSION NUDGE  (Build Plan Section 7.1)
+    # ==========================================================
+
+    def _check_session_nudge(self, ctx: Dict) -> Optional[str]:
+        """
+        Returns a nudge message if the user has been active for 2+ hours
+        and we haven't sent a nudge yet this session.
+        """
+        if ctx.get("nudge_sent"):
+            return None
+        elapsed = time.time() - ctx.get("session_start_ts", time.time())
+        if elapsed >= _SESSION_NUDGE_SECS:
+            ctx["nudge_sent"] = True
+            return self._lang(
+                "Hey — you've been here for a while. Take a break, drink some water. "
+                "I'll be right here when you come back. 😊",
+                "Yaar — bahut der se baat kar rahe ho. Thoda break lo, paani piyo. "
+                "Main yahan hi hoon. 😊",
+                "Hey — bahut der ho gayi. Take a break! "
+                "I'll be right here. 😊",
+            )
+        return None
+
+    # ==========================================================
+    # EXECUTE
+    # ==========================================================
+
+    def execute(self, parsed: Dict[str, Any], text: str,
+                context: Optional[Dict[str, Any]] = None,
+                user_id: str = "default") -> Dict[str, Any]:
 
         ctx      = context if context is not None else self.context
         intent   = (parsed.get("intent") or "unknown").strip()
         entities = parsed.get("entities") or {}
 
+        ctx["interrupt"]  = False
+        ctx["plan_state"] = {}
+
         self._log("user", text)
         ctx["last_intent"]  = intent
         ctx["last_command"] = text
 
+        # IMP-2: Crisis check — always fires first, before any other routing.
+        # Response is hardcoded — never LLM-generated.
+        if _is_crisis(text):
+            lang = ctx.get("language", "en")
+            if lang == "hi":
+                return self._resp(_CRISIS_RESPONSE_HI)
+            elif lang == "mixed":
+                return self._resp(_CRISIS_RESPONSE_MIXED)
+            return self._resp(_CRISIS_RESPONSE_EN)
+
+        # IMP-7: Dependency check
+        if _is_dependency_statement(text):
+            lang = ctx.get("language", "en")
+            if lang == "hi":
+                return self._resp(_DEPENDENCY_RESPONSE_HI)
+            elif lang == "mixed":
+                return self._resp(_DEPENDENCY_RESPONSE_MIXED)
+            return self._resp(_DEPENDENCY_RESPONSE_EN)
+
+        # IMP-6: Session nudge check (appended to normal response below)
+        nudge = self._check_session_nudge(ctx)
+
+        # IMP-5: Onboarding check
+        if not ctx.get("onboarding_complete"):
+            onboarding_resp = self._handle_onboarding(text, ctx, user_id)
+            if onboarding_resp is not None:
+                return onboarding_resp
+        
         try:
-            result = self._route(intent, entities, text, ctx)
+            result = self._route(intent, entities, text, ctx, user_id)
         except Exception as e:
             logger.exception("Unhandled executor error: %s", e)
             result = self._resp(self._lang(
                 "Something went wrong. Please try again.",
-                "Kuch gadbad ho gayi. Dobara try karo."
+                "Kuch gadbad ho gayi. Dobara try karo.",
+                "Kuch gadbad ho gayi. Please try again.",
             ))
+
+        # IMP-6: Append nudge to result if triggered
+        if nudge:
+            result["text"]  = result.get("text", "") + f"\n\n{nudge}"
+            result["voice"] = result["text"]
 
         self._save_profile(user_id)
         return result
 
-    # ==================================================================
+    # ==========================================================
     # ROUTER
-    # ==================================================================
+    # ==========================================================
 
-    def _route(
-        self,
-        intent:   str,
-        entities: Dict[str, Any],
-        text:     str,
-        ctx:      Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _route(self, intent: str, entities: Dict[str, Any],
+               text: str, ctx: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+        if intent == "clarify":
+            question = entities.get("question", "Thoda aur explain karein?")
+            return self._resp(question)
 
-        # ── GREETING ──────────────────────────────────────────────────
-        if intent == "greeting":
+        if intent in ("cancelled", "none"):
+            return self._resp(self._lang(
+                "Okay, cancelled.",
+                "Theek hai, cancel kar diya.",
+                "Okay, cancel.",
+            ))
+
+        if intent == "greet":
             if not ctx.get("has_greeted"):
                 ctx["has_greeted"] = True
                 return self._resp(self._lang(
-                    "Hello! Radhe here. How can I help you?",
-                    "Namaste! Main Radhe hoon. Kya help kar sakta hoon?"
+                    "Hello! I'm Radhe. How can I help you?",
+                    "Namaste! Main Radhe hoon. Kaise madad kar sakta hoon?",
+                    "Hello! Main Radhe hoon. How can I help?",
                 ))
-            return self._resp(self._lang("Yes, I'm listening.", "Haan, bol."))
-
-        # ── SMALLTALK ─────────────────────────────────────────────────
-        elif intent == "conversation_smalltalk":
             return self._resp(self._lang(
-                "I'm doing well! Always here for you. How's your day going?",
-                "Main theek hoon! Hamesha tumhare liye hoon. Tumhara din kaisa ja raha hai?"
+                "Hey! What can I do for you?",
+                "Haan bolo!",
+                "Hey! Bolo, kya chahiye?",
             ))
 
-        # ── PERSONA ───────────────────────────────────────────────────
-        elif intent == "persona_query":
-            return self._resp(self._lang(
-                "I'm Radhe, your personal AI companion. I can open apps, search the web, "
-                "set reminders, send WhatsApp messages, answer questions, and more.",
-                "Main Radhe hoon, tumhara personal AI companion. Main apps khol sakta hoon, "
-                "web search, reminders, WhatsApp messages, aur bahut kuch."
+        if intent == "ask_question":
+            return self._resp(self._ai_with_memory(text, ctx, user_id))
+
+        if intent == "open_app":
+            app = entities.get("app", "")
+            return self._resp(_normalize_tool_result(system_controller.open_app(app))
+                or self._lang(f"Opening {app}.", f"{app} khol raha hoon.", f"Opening {app}."))
+
+        if intent == "close_app":
+            app = entities.get("app", "")
+            return self._resp(_normalize_tool_result(system_controller.close_app(app))
+                or self._lang(f"Closed {app}.", f"{app} band kar diya.", f"Closed {app}."))
+
+        if intent == "volume_control":
+            return self._resp(_normalize_tool_result(system_controller.set_volume(
+                level=entities.get("level"), action=entities.get("action", "")
+            )) or self._lang("Volume adjusted.", "Volume set kar diya.", "Volume set kar diya."))
+
+        if intent == "brightness_control":
+            return self._resp(_normalize_tool_result(system_controller.set_brightness(
+                level=entities.get("level")
+            )) or self._lang("Brightness adjusted.", "Brightness set kar diya.", "Brightness set."))
+
+        if intent == "take_screenshot":
+            return self._resp(_normalize_tool_result(system_controller.take_screenshot())
+                or self._lang("Screenshot taken.", "Screenshot le liya.", "Screenshot le liya."))
+
+        if intent == "system_info":
+            return self._resp(_normalize_tool_result(system_controller.get_system_info())
+                or self._lang("Fetching system info.", "System info la raha hoon.", "System info la raha hoon."))
+
+        if intent == "web_search":
+            query = entities.get("query", text)
+            return self._resp(_normalize_tool_result(web_controller.search(query))
+                or self._lang(f"Searching for {query}.", f"{query} search kar raha hoon.", f"Searching: {query}."))
+
+        if intent == "open_website":
+            url = entities.get("url", "")
+            return self._resp(_normalize_tool_result(web_controller.open_url(url))
+                or self._lang(f"Opening {url}.", f"{url} khol raha hoon.", f"Opening {url}."))
+
+        if intent == "youtube_search":
+            query = entities.get("query", text)
+            return self._resp(_normalize_tool_result(web_controller.youtube_search(query))
+                or self._lang(
+                    f"Searching YouTube for {query}.",
+                    f"YouTube pe {query} dhundh raha hoon.",
+                    f"YouTube pe {query} search kar raha hoon.",
+                ))
+
+        if intent == "send_message":
+            contact = entities.get("contact", "")
+            message = entities.get("message", "")
+            if not contact:
+                # BUG-3 FIX: store the full pending state so execute()
+                # can pick it up on the very next turn.
+                ctx["awaiting_contact"] = {
+                    "pending_intent": "send_message",
+                    "message": message,
+                }
+                return self._resp(self._lang(
+                    "Who should I send the message to?",
+                    "Kisko bhejun message?",
+                    "Kisko bhejun? Tell me the name or number.",
+                ))
+            return self._resp(_normalize_tool_result(
+                messaging_service.send(platform="whatsapp", contact_name=contact, message=message)
+            ) or self._lang(
+                f"Message sent to {contact}.",
+                f"{contact} ko message bhej diya.",
+                f"Message sent to {contact}.",
             ))
 
-        # ── THANKS ────────────────────────────────────────────────────
-        elif intent == "thanks":
-            return self._resp(self._lang("You're welcome!", "Aapka swagat hai!"))
+        if intent == "make_call":
+            contact = entities.get("contact", "")
+            if not contact:
+                ctx["awaiting_contact"] = {"pending_intent": "make_call"}
+                return self._resp(self._lang(
+                    "Who should I call?",
+                    "Kisko call karun?",
+                    "Kisko call karun? Bolo.",
+                ))
+            return self._resp(_normalize_tool_result(messaging_service.call(contact=contact))
+                or self._lang(
+                    f"Calling {contact}.",
+                    f"{contact} ko call kar raha hoon.",
+                    f"Calling {contact}.",
+                ))
 
-        # ── GOODBYE ───────────────────────────────────────────────────
-        elif intent == "goodbye":
-            return self._resp(self._lang("Goodbye! Take care.", "Theek hai, phir milte hain."))
-
-        # ── LANGUAGE CHANGE ───────────────────────────────────────────
-        elif intent == "change_language":
-            target = (entities.get("target_language") or "").lower()
-            if not target:
-                lower = text.lower()
-                if "hindi" in lower:  target = "hi"
-                elif "english" in lower: target = "en"
-                else: target = "en"
-
-            if target not in ("en", "hi", "mixed"):
-                return self._resp("I didn't catch which language. English or Hindi?")
-
-            ctx["language"] = target
-            self.context["language"] = target
-
-            if target == "hi":
-                return self._resp("Theek hai, ab main Hindi mein baat karunga.")
-            elif target == "en":
-                return self._resp("Alright, switching to English.")
-            return self._resp("Thik hai, ab Hinglish mein baat karte hain.")
-
-        # ── MODE CHANGE ───────────────────────────────────────────────
-        elif intent == "change_mode":
-            target = (entities.get("target_mode") or "").lower()
-            lower  = text.lower()
-            if not target:
-                if any(w in lower for w in ["casual", "normal", "bina formal"]): target = "casual"
-                elif "formal" in lower: target = "formal"
-                else: target = "neutral"
-
-            ctx["mode"] = target
-            self.context["mode"] = target
-            return self._resp(self._lang(
-                f"Switched to {target} mode.",
-                f"Theek hai, {target} mode mein baat karte hain."
-            ))
-
-        # ── TIME / DATE ───────────────────────────────────────────────
-        elif intent == "get_time":
-            return self._resp(utility_manager.get_time())
-
-        elif intent == "get_date":
-            return self._resp(utility_manager.get_date())
-
-        # ── APPS ──────────────────────────────────────────────────────
-        elif intent == "open_app":
-            app = (entities.get("application") or "").strip()
-            if not app:
-                return self._resp(self._lang("Which app should I open?", "Kaunsi app kholun?"))
-            return self._resp(system_controller.open_app(app))
-
-        elif intent == "close_app":
-            app = (entities.get("application") or "").strip()
-            if not app:
-                return self._resp(self._lang("Which app should I close?", "Kaunsi app band karun?"))
-            return self._resp(system_controller.close_application(app))
-
-        # ── WEB ───────────────────────────────────────────────────────
-        elif intent == "search_web":
-            query = (entities.get("query") or text).strip()
-            return self._resp(web_controller.google_search(query))
-
-        elif intent == "open_website":
-            site = (entities.get("website") or "").strip()
-            if not site:
-                return self._resp(self._lang("Which website?", "Kaunsi website kholun?"))
-            return self._resp(web_controller.open_website(site))
-
-        elif intent == "youtube_search":
-            query = (entities.get("query") or text).strip()
-            return self._resp(web_controller.youtube_search(query))
-
-        elif intent == "get_directions":
-            origin = (entities.get("origin")      or "").strip()
-            dest   = (entities.get("destination") or "").strip()
-            return self._resp(web_controller.get_maps(origin=origin, dest=dest))
-
-        elif intent == "check_internet":
-            return self._resp(web_controller.check_internet())
-        # ADD inside _route() (place under WEB section or nearby)
-
-        elif intent == "news_search":
-            topic = (entities.get("topic") or "").strip()
-            return self._resp(web_controller.news_search(topic))
-
-        elif intent == "get_weather":
-            location = (entities.get("location") or "").strip()
-            return self._resp(web_controller.get_weather(location))
-
-        # ── SYSTEM ────────────────────────────────────────────────────
-        elif intent == "system_control":
-            ctrl = (entities.get("control_type") or "").strip()
-            return self._resp(system_controller.system_control(ctrl))
-
-        elif intent == "get_battery":
-            return self._resp(system_controller.get_battery_status())
-
-        elif intent == "set_volume":
-            level = entities.get("level", 50)
-            try:
-                level = int(level)
-            except (TypeError, ValueError):
-                level = 50
-            return self._resp(system_controller.set_volume(level))
-
-        elif intent == "take_screenshot":
-            path = system_controller.take_screenshot()
-            if path:
-                return self._resp(f"Screenshot saved to {path}.")
-            return self._resp("Screenshot failed.")
-
-        # ── REMINDER ─────────────────────────────────────────────────
-        elif intent == "set_reminder":
+        if intent == "set_reminder":
             rm = ctx.get("reminder_manager")
-            if not rm:
-                return self._resp(self._lang(
-                    "Reminder system is not available.",
-                    "Reminder system available nahi hai."
-                ))
-            task     = (entities.get("reminder_text") or text).strip()
-            time_str = (entities.get("time")          or "").strip()
-            ok = rm.add_reminder(task, time_str)
-            if ok:
-                return self._resp(self._lang(
-                    f"Reminder set: {task}",
-                    f"Reminder set ho gaya: {task}"
-                ))
+            if rm:
+                return self._resp(_normalize_tool_result(
+                    rm.set(entities.get("reminder", text), entities.get("time", ""))
+                ) or self._lang("Reminder set.", "Reminder laga diya.", "Reminder set ho gaya."))
             return self._resp(self._lang(
-                "I couldn't understand the time for that reminder.",
-                "Reminder ka time samajh nahi aaya."
+                "Reminder manager not available.",
+                "Reminder system available nahi hai.",
+                "Reminder system abhi available nahi hai.",
             ))
 
-        elif intent == "list_reminders":
+        if intent == "list_reminders":
             rm = ctx.get("reminder_manager")
-            if not rm:
-                return self._resp("Reminder system not available.")
-            return self._resp(rm.list_reminders())
-
-        elif intent == "cancel_reminder":
-            rm      = ctx.get("reminder_manager")
-            keyword = (entities.get("keyword") or text).strip()
-            if not rm:
-                return self._resp("Reminder system not available.")
-            return self._resp(rm.cancel_reminder(keyword))
-
-        # ── MESSAGING ────────────────────────────────────────────────
-        elif intent == "send_message":
-            return self._handle_message(entities, text, ctx)
-
-        elif intent == "start_whatsapp":
-            return self._resp(messaging_service.start_whatsapp_session())
-
-        elif intent == "whatsapp_status":
-            return self._resp(messaging_service.get_status())
-
-        # ── NLP TOOLS ────────────────────────────────────────────────
-        elif intent == "summarize_text":
-            summary = nlp_manager.summarize_text(text)
+            if rm:
+                return self._resp(_normalize_tool_result(rm.list_all())
+                    or self._lang("No reminders found.", "Koi reminder nahi mila.", "Koi reminder nahi mila."))
             return self._resp(self._lang(
-                f"Here's a summary: {summary}",
-                f"Yeh summary hai: {summary}"
+                "Reminder manager not available.",
+                "Reminder system available nahi hai.",
+                "Reminder system available nahi hai.",
             ))
 
-        elif intent == "sentiment_check":
-            result     = nlp_manager.detect_sentiment(text)
-            sentiment  = result.get("sentiment",  "NEUTRAL")
-            confidence = result.get("confidence", 0.5)
-            return self._resp(self._lang(
-                f"Sentiment: {sentiment} (confidence {confidence:.2f})",
-                f"Mood: {sentiment} (vishwas {confidence:.2f})"
-            ))
+        if intent == "get_time":
+            return self._resp(_normalize_tool_result(utility_manager.get_time())
+                or self._lang("Fetching time.", "Time la raha hoon.", "Time la raha hoon."))
 
-        elif intent == "keyword_extract":
-            keywords = nlp_manager.extract_keywords(text)
-            if keywords:
+        if intent == "get_date":
+            return self._resp(_normalize_tool_result(utility_manager.get_date())
+                or self._lang("Fetching date.", "Date la raha hoon.", "Date la raha hoon."))
+
+        if intent == "get_weather":
+            return self._resp(_normalize_tool_result(
+                utility_manager.get_weather(entities.get("location", ""))
+            ) or self._lang("Fetching weather.", "Mausam dekh raha hoon.", "Mausam dekh raha hoon."))
+
+        if intent == "calculate":
+            return self._resp(_normalize_tool_result(
+                utility_manager.calculate(entities.get("expression", text))
+            ) or self._lang("Calculating.", "Calculate kar raha hoon.", "Calculate kar raha hoon."))
+
+        if intent == "translate":
+            return self._resp(_normalize_tool_result(
+                utility_manager.translate(
+                    entities.get("phrase", text), entities.get("target_language", "en")
+                )
+            ) or self._lang("Translating.", "Translate kar raha hoon.", "Translate kar raha hoon."))
+
+        if intent == "run_automation":
+            task = entities.get("task", "")
+            return self._resp(_normalize_tool_result(automation_manager.run(task))
+                or self._lang(
+                    f"Running {task}.",
+                    f"{task} chala raha hoon.",
+                    f"{task} chala raha hoon.",
+                ))
+
+        if intent == "set_language":
+            lang = entities.get("language", "en")
+            if lang in ("en", "hi", "mixed"):
+                ctx["language"] = lang
+                self._save_profile(user_id)
                 return self._resp(self._lang(
-                    "Top keywords: " + ", ".join(keywords),
-                    "Mukhya shabd: "  + ", ".join(keywords)
+                    f"Language set to {lang}.",
+                    f"Bhasha {lang} kar di.",
+                    f"Language {lang} kar di.",
                 ))
             return self._resp(self._lang(
-                "No strong keywords found.",
-                "Koi khaas keywords nahi mile."
-            ))
+                "Unsupported language.", "Yeh bhasha support nahi hai.", "Yeh bhasha nahi pata."))
 
-        # ── VISION ───────────────────────────────────────────────────
-        elif intent == "analyze_screen":
-            result = vision_manager.capture_screen_and_analyze()
-            return self._resp(result)
+        if intent == "set_mode":
+            mode = entities.get("mode", "neutral")
+            if mode in ("neutral", "casual", "formal"):
+                ctx["mode"] = mode
+                self._save_profile(user_id)
+                return self._resp(self._lang(
+                    f"Mode set to {mode}.",
+                    f"Mode {mode} kar diya.",
+                    f"Mode {mode} kar diya.",
+                ))
+            return self._resp(self._lang("Unknown mode.", "Yeh mode nahi pata.", "Yeh mode nahi pata."))
 
-        elif intent == "analyze_image":
-            path = (entities.get("path") or "").strip()
-            if not path:
-                return self._resp("Please tell me which image file to analyze.")
-            return self._resp(vision_manager.analyze_image(path))
+        if intent == "describe_screen":
+            return self._resp(_normalize_tool_result(vision_manager.describe_screen())
+                or self._lang("Analysing screen.", "Screen dekh raha hoon.", "Screen dekh raha hoon."))
 
-        # ── Q&A ───────────────────────────────────────────────────────
-        elif intent == "ask_question":
-            return self._resp(self._ai(text, ctx))
+        if intent == "read_text":
+            return self._resp(_normalize_tool_result(vision_manager.read_text())
+                or self._lang(
+                    "Reading text from screen.",
+                    "Screen pe text padh raha hoon.",
+                    "Screen pe text padh raha hoon.",
+                ))
 
-        # ── FALLBACK ──────────────────────────────────────────────────
-        else:
-            return self._resp(self._ai(text, ctx))
-
-    # ==================================================================
-    # MESSAGE HANDLER
-    # ==================================================================
-
-    def _handle_message(
-        self,
-        entities: Dict[str, Any],
-        text:     str,
-        ctx:      Dict[str, Any]
-    ) -> Dict[str, Any]:
-
-        # ── If we're waiting for a phone number, handle that first ────
-        awaiting = ctx.get("awaiting_contact")
-        if awaiting and _looks_like_phone(text):
-            return self._handle_awaiting_contact(text, ctx)
-
-        platform = (entities.get("platform") or "whatsapp").lower().strip()
-        contact  = (entities.get("contact")  or "").strip()
-        message  = (entities.get("message")  or "").strip()
-
-        # Fallback message extraction from raw text
-        if not message:
-            lower = text.lower()
-            for kw in ("saying", "that", "message"):
-                if kw in lower:
-                    part = text.split(kw, 1)[1].strip()
-                    if part:
-                        message = part
-                        break
-
-        if not message:
+        if intent in ("stop", "exit", "quit"):
+            ctx["interrupt"] = True
             return self._resp(self._lang(
-                "What message should I send?",
-                "Kya message bhejna hai?"
+                "Goodbye! See you soon.",
+                "Alvida! Phir milenge.",
+                "Alvida! Take care.",
             ))
 
-        if not contact:
-            return self._resp(self._lang(
-                "Who should I send it to?",
-                "Kise bhejna hai?"
-            ))
-
-        # Store pending state in case contact is not found
-        ctx["awaiting_contact"] = {
-            "contact_name": contact,
-            "message":      message,
-            "platform":     platform
-        }
-
-        result = messaging_service.send(platform, contact, message)
-
-        # Clear pending state only on genuine success
-        if not any(s in result.lower() for s in _FAILURE_SIGNALS):
-            ctx["awaiting_contact"] = None
-
-        return self._resp(result)
-
-    # ==================================================================
-    # AWAITING CONTACT HANDLER
-    # ==================================================================
-
-    def _handle_awaiting_contact(
-        self,
-        text: str,
-        ctx:  Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Complete a pending send by saving the phone number the user just provided."""
-
-        awaiting     = ctx.get("awaiting_contact", {})
-        contact_name = awaiting.get("contact_name", "")
-        message      = awaiting.get("message",      "")
-        platform     = awaiting.get("platform",     "whatsapp")
-
-        phone = re.sub(r"[^\d+]", "", text).strip()
-
-        if not phone or len(re.sub(r"[^\d]", "", phone)) < 7:
-            return self._resp(self._lang(
-                "That doesn't look like a valid phone number. "
-                "Please give it in international format, like +919876543210.",
-                "Yeh valid phone number nahi lagta. "
-                "Please +919876543210 jaise format mein do."
-            ))
-
-        result = messaging_service.save_and_send(
-            contact_name, phone, message, platform
-        )
-
-        # Always clear after attempting save_and_send
-        ctx["awaiting_contact"] = None
-
-        return self._resp(result)
+        # Default: memory-aware AI response
+        return self._resp(self._ai_with_memory(text, ctx, user_id))
 
 
-# ==================================================================
-# MODULE-LEVEL HELPER
-# ==================================================================
-
-def _looks_like_phone(text: str) -> bool:
-    """
-    Return True if text looks like a phone number response.
-    Word count guard prevents a normal sentence containing a number
-    from triggering the phone-number handler.
-    """
-    digits     = re.sub(r"[^\d]", "", text)
-    word_count = len(text.strip().split())
-    return len(digits) >= 7 and word_count <= 3
-
-
-# ==================================================================
+# ==========================================================
 # GLOBAL INSTANCE
-# ==================================================================
+# ==========================================================
 
 executor = CommandExecutor()

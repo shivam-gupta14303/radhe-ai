@@ -1,4 +1,4 @@
-# src/interfaces/flask_server.py
+# interfaces/flask_server.py
 """
 REST API server for Radhe.
 Lets mobile apps / Postman / external tools send commands via HTTP.
@@ -8,10 +8,10 @@ Endpoints:
     POST /command         — send a text command, get a response
 
 Run standalone:
-    python -m src.interfaces.flask_server
+    python -m interfaces.flask_server
 
 Or import and run in a background thread from radhe.py:
-    from src.interfaces.flask_server import start_flask_server
+    from interfaces.flask_server import start_flask_server
     start_flask_server()
 """
 
@@ -22,11 +22,11 @@ from functools import wraps
 
 from flask import Flask, jsonify, request
 
-from src.command_parser import CommandParser
-from src.command_executor import executor
+from command_parser import CommandParser
+from command_executor import executor
 
 # 🔥 LLM engine — must be imported before any ai_knowledge call
-import src.llm_setup  # noqa: F401  (side effect: attaches brain.llm_client)
+import llm_setup  # noqa: F401  (side effect: attaches brain.llm_client)
 
 # ── Optional token auth ───────────────────────────────────────────────
 # Set env var RADHE_API_TOKEN to enable.  Leave unset to disable.
@@ -139,7 +139,7 @@ def start_flask_server(
     the voice loop without blocking it.
 
     Usage in radhe.py:
-        from src.interfaces.flask_server import start_flask_server
+        from interfaces.flask_server import start_flask_server
         start_flask_server()    # returns immediately
         run()                   # voice loop blocks here
     """

@@ -164,6 +164,50 @@ class UtilityManager:
         if location:
             return f"Let me check the weather for {location}."
         return "Let me check the current weather."
+    
+    # ==================================================================
+    # CALCULATOR
+    # ==================================================================
+
+    def calculate(self, expression: str) -> str:
+        try:
+            import re
+            import math
+
+            # Allow only safe characters
+            safe = re.sub(r"[^0-9+\-*/().\s]", "", expression)
+
+            if not safe.strip():
+                return "Invalid expression."
+
+            # Safe eval environment (no builtins)
+            result = eval(safe, {"__builtins__": None}, {"math": math})
+
+            return f"Result: {result}"
+
+        except Exception:
+            return f"Could not calculate: {expression}"
+        
+    # ==================================================================
+    # TRANSLATION
+    # ==================================================================
+        
+    def translate(self, phrase: str, target_language: str = "en") -> str:
+        try:
+            if not phrase.strip():
+                return "Please provide text to translate."
+
+            from deep_translator import GoogleTranslator
+
+            result = GoogleTranslator(
+                source="auto",
+                target=target_language
+            ).translate(phrase)
+
+            return result or phrase
+
+        except Exception:
+            return f"Translation unavailable. Original: {phrase}"
 
 
 # ── Global instance ───────────────────────────────────────────────────

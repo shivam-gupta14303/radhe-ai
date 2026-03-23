@@ -146,7 +146,8 @@ class SocialMediaIntegrator:
         # ── Plug into executor for auto-reply (when executor is connected) ──
         if self._executor_ref is not None:
             try:
-                from src.command_parser import CommandParser
+                from command_parser import CommandParser
+                from contact_manager import contact_manager
                 parser = CommandParser()
 
                 # Treat incoming message as a user command
@@ -155,8 +156,17 @@ class SocialMediaIntegrator:
                 reply  = result.get("text", "")
 
                 if reply:
-                    self.send_whatsapp_by_contact(sender, reply)
-                    logger.info("Auto-replied to %s: %s", sender, reply)
+                    contact = contact_manager.get_contact(sender)
+
+                    if contact and contact.get("phone"):
+                        phone = contact["phone"]
+                        self.whatsapp.send_message(phone, reply)
+                        logger.info("Auto-replied to %s (%s): %s", sender, phone, reply)
+                    else:
+                        logger.warning(
+                            "Auto-reply skipped — no phone number found for sender: %s", 
+                            sender
+                        )
 
             except Exception as e:
                 logger.exception("Auto-reply failed: %s", e)

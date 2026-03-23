@@ -2,34 +2,115 @@
 """
 Speech module for Radhe — TTS + ASR.
 
-Improvements vs previous version:
-- speak() queues speech so it never overlaps (thread-safe queue-based TTS).
-- listen_for_wake_word() resets the 60s timeout on each loop iteration
-  so the assistant listens indefinitely without returning False.
-- Language auto-detection hint passed to ASR.
-- get_voice_input() is a simple convenience wrapper.
+Fixes vs previous version:
+  - ElevenLabs: correct API is text_to_speech.convert() not generate()
+  - Whisper:    Windows-safe temp file path (WinError 2 fix)
+  - speak():    text cleaned before TTS — removes emoji, slash, brackets
+                so pyttsx3 never reads "haan slash nahi" or "tick slash cross"
+  - Vosk + Google fallback preserved
 """
 
 import os
-import logging
-import json
+import imageio_ffmpeg as ffmpeg
+os.environ["FFMPEG_BINARY"] = ffmpeg.get_ffmpeg_exe()
+os.environ["PATH"] += os.pathsep + os.path.dirname(ffmpeg.get_ffmpeg_exe())
 import re
+import json
+import logging
+import queue
+import tempfile
 import threading
 import time
-import queue
-import speech_recognition as sr
-import pyttsx3
-
 from typing import List, Optional
 
+import pyttsx3
+import speech_recognition as sr
 logger = logging.getLogger("Radhe_Speech")
 logger.setLevel(logging.INFO)
 
-# ── Microphone (singleton) ────────────────────────────────────────────
+# ── ENV ───────────────────────────────────────────────────────────────
+ELEVEN_API_KEY  = os.getenv("ELEVEN_API_KEY",  "")
+ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "")
+
+# ── ElevenLabs client (optional) ─────────────────────────────────────
+_eleven_client = None
+if ELEVEN_API_KEY:
+    try:
+        from elevenlabs.client import ElevenLabs
+        from elevenlabs import play as eleven_play       
+        _eleven_client = ElevenLabs(api_key=ELEVEN_API_KEY)
+        logger.info("ElevenLabs client initialised.")
+    except Exception as e:
+        logger.warning("ElevenLabs init failed: %s", e)
+
+# ── Whisper model (optional) ─────────────────────────────────────────
+_whisper_model = None
+try:
+    import whisper as _whisper_lib
+    _whisper_model = _whisper_lib.load_model("small")
+    logger.info("Whisper model loaded.")
+except Exception as e:
+    logger.warning("Whisper load failed: %s", e)
+
+# ── Microphone singleton ──────────────────────────────────────────────
 _MIC = sr.Microphone()
 
+
 # ======================================================================
-#  TTS  —  queue-based, thread-safe, non-overlapping
+#  TEXT CLEANER  — strips anything pyttsx3 reads wrong
+# ======================================================================
+
+# Emoji pattern
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"   # emoticons
+    "\U0001F300-\U0001F5FF"   # symbols & pictographs
+    "\U0001F680-\U0001F6FF"   # transport & map
+    "\U0001F1E0-\U0001F1FF"   # flags
+    "\U00002702-\U000027B0"
+    "\U000024C2-\U0001F251"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _clean_for_tts(text: str) -> str:
+    """
+    Remove or replace characters that pyttsx3 reads literally.
+
+    Examples fixed:
+      "haan/nahi"          → "haan ya nahi"
+      "[haan/nahi]"        → "haan ya nahi"
+      "✅/❌"               → ""
+      "⚠️ Confirm karo"    → "Confirm karo"
+      "Ho gaya! {detail}"  → "Ho gaya! {detail}"   (braces kept — may be formatted)
+    """
+    if not text:
+        return ""
+
+    # Remove emoji
+    text = _EMOJI_RE.sub("", text)
+
+    # Replace slash between words with " ya " (natural Hindi/English)
+    text = re.sub(r"\b(\w+)\s*/\s*(\w+)\b", r"\1 ya \2", text)
+
+    # Remove remaining slashes
+    text = text.replace("/", " ")
+
+    # Remove square brackets
+    text = re.sub(r"\[|\]", "", text)
+
+    # Remove Unicode symbols that aren't letters/numbers/punctuation
+    text = re.sub(r"[^\w\s\.,!?।\-\'\"():;%@+]", "", text)
+
+    # Collapse extra whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+# ======================================================================
+#  TTS  —  queue-based, thread-safe
 # ======================================================================
 
 _tts_engine: Optional[pyttsx3.Engine] = None
@@ -48,11 +129,10 @@ def _init_tts() -> pyttsx3.Engine:
 
 
 def _tts_worker():
-    """Background thread that serialises all speech."""
     engine = _init_tts()
     while True:
         text = _tts_queue.get()
-        if text is None:     # poison pill — shut down
+        if text is None:
             break
         with _tts_lock:
             try:
@@ -63,7 +143,7 @@ def _tts_worker():
                 engine.say(text)
                 engine.runAndWait()
             except Exception as e:
-                logger.exception("TTS error: %s", e)
+                logger.exception("pyttsx3 error: %s", e)
         _tts_queue.task_done()
 
 
@@ -75,16 +155,74 @@ def _ensure_tts_thread():
 
 
 def speak(text: str) -> None:
-    """Queue text for speech. Returns immediately (non-blocking)."""
+    """
+    Speak text aloud.
+    - Cleans text first (removes emoji, slash, brackets).
+    - Tries ElevenLabs first, falls back to pyttsx3.
+    - Non-blocking: returns immediately.
+    """
     if not text:
         return
-    logger.info("TTS queued: %s", text)
+
+    clean = _clean_for_tts(text)
+    if not clean:
+        return
+
+    logger.info("TTS: %s", clean)
+
+    # ── ElevenLabs ─────────────────────────
+    if _eleven_client and ELEVEN_VOICE_ID:
+        try:
+            audio_stream = _eleven_client.text_to_speech.convert(
+                text=clean,
+                voice_id=ELEVEN_VOICE_ID,
+                model_id="eleven_multilingual_v2",
+            )
+
+            # convert stream → bytes
+            audio_bytes = b"".join(audio_stream)
+
+            eleven_play(audio_bytes)
+            return
+
+        except Exception as e:
+            logger.warning("ElevenLabs failed, using pyttsx3: %s", e)
+
+    # ── pyttsx3 fallback ─────────────────────────────────────────────
     _ensure_tts_thread()
-    _tts_queue.put(text)
+    _tts_queue.put(clean)
 
 
 # ======================================================================
-#  ASR  —  Vosk offline + Google fallback
+#  WHISPER  (Fix: Windows-safe temp file)
+# ======================================================================
+
+def _recognize_whisper(audio_data: sr.AudioData) -> str:
+    if not _whisper_model:
+        return ""
+    try:
+        import tempfile
+        tmp_path = os.path.join(tempfile.gettempdir(), "radhe_audio.wav")
+
+        with open(tmp_path, "wb") as f:
+            f.write(audio_data.get_wav_data())
+
+        result = _whisper_model.transcribe(tmp_path)
+
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+        return result.get("text", "").lower().strip()
+
+    except Exception as e:
+        logger.warning("Whisper error: %s", e)
+        return ""
+
+
+# ======================================================================
+#  VOSK  (offline, no internet)
 # ======================================================================
 
 try:
@@ -97,8 +235,8 @@ BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 VOSK_MODEL_PATH_EN = os.path.join(BASE_DIR, "vosk-model-en")
 VOSK_MODEL_PATH_HI = os.path.join(BASE_DIR, "vosk-model-hi")
 
-_model_en: Optional["Model"] = None
-_model_hi: Optional["Model"] = None
+_model_en = None
+_model_hi = None
 
 
 def _load_vosk_models():
@@ -136,6 +274,10 @@ def _recognize_vosk(raw: bytes, language: str) -> str:
         return ""
 
 
+# ======================================================================
+#  GOOGLE FALLBACK
+# ======================================================================
+
 def _recognize_google(r: sr.Recognizer, audio: sr.AudioData, language: str) -> str:
     try:
         lang_code = "hi-IN" if language.startswith("hi") else "en-IN"
@@ -145,39 +287,55 @@ def _recognize_google(r: sr.Recognizer, audio: sr.AudioData, language: str) -> s
         return ""
 
 
+# ======================================================================
+#  MASTER ASR  —  Whisper → Vosk → Google
+# ======================================================================
+
 def recognize_audio_chunk(
-    recognizer: sr.Recognizer,
-    audio_data: sr.AudioData,
-    language:   str = "en"
+    recognizer:  sr.Recognizer,
+    audio_data:  sr.AudioData,
+    language:    str  = "en",
+    use_whisper: bool = True,
 ) -> str:
+    """
+    ASR pipeline:
+      1. Whisper  (best accuracy, Hindi-English mixed)
+      2. Vosk     (offline fallback)
+      3. Google   (online fallback)
+    """
     try:
+        if use_whisper:
+            text = _recognize_whisper(audio_data)
+            if text:
+                return text
+
         raw = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+
         if VOSK_AVAILABLE:
             text = _recognize_vosk(raw, language)
             if text:
                 return text.lower().strip()
+
         return _recognize_google(recognizer, audio_data, language)
+
     except Exception as e:
         logger.warning("recognize_audio_chunk failed: %s", e)
         return ""
 
 
 # ======================================================================
-#  WAKE WORD
+#  WAKE WORD  (Vosk/Google only — Whisper too slow for hot-word)
 # ======================================================================
 
 def listen_for_wake_word(
     wake_word:      str   = "radhe",
     wake_lang:      str   = "en",
-    chunk_duration: float = 2.5
+    chunk_duration: float = 2.5,
 ) -> bool:
     """
-    Listen continuously until the wake word is detected.
-    Returns True when detected, False only on KeyboardInterrupt.
-
-    Fix vs previous version:
-    - Removed the 60-second timeout that returned False — the assistant
-      should listen indefinitely. The caller controls when to stop.
+    Listen continuously until wake word detected.
+    Returns True on detection, False on KeyboardInterrupt only.
+    Whisper is OFF here — too slow for continuous wake-word polling.
     """
     r = sr.Recognizer()
 
@@ -187,21 +345,25 @@ def listen_for_wake_word(
 
         while True:
             try:
-                audio = r.listen(source, timeout=chunk_duration,
-                                 phrase_time_limit=chunk_duration)
-                text  = recognize_audio_chunk(r, audio, wake_lang)
+                audio = r.listen(
+                    source,
+                    timeout          = chunk_duration,
+                    phrase_time_limit= chunk_duration,
+                )
+                # use_whisper=False for speed
+                text = recognize_audio_chunk(r, audio, wake_lang, use_whisper=False)
 
                 if not text:
                     continue
 
                 logger.debug("Heard: %s", text)
 
-                if wake_word.lower()[:3] in text.lower():   # tolerant match ("rad" in "radhe")
-                    logger.info("Wake word detected in: '%s'", text)
+                if wake_word.lower()[:3] in text.lower():
+                    logger.info("Wake word detected: '%s'", text)
                     return True
 
             except sr.WaitTimeoutError:
-                continue   # normal — just no speech in this chunk
+                continue
 
             except KeyboardInterrupt:
                 logger.info("Wake word listener interrupted.")
@@ -213,16 +375,17 @@ def listen_for_wake_word(
 
 
 # ======================================================================
-#  COMMAND CAPTURE
+#  COMMAND CAPTURE  (Whisper ON for accuracy)
 # ======================================================================
 
 def capture_multi_commands(
     command_lang: str = "en",
-    phrase_limit: int = 12
+    phrase_limit: int = 12,
 ) -> List[str]:
     """
-    Capture a spoken command after wake word detection.
-    Returns a list of command strings (split on punctuation).
+    Capture a spoken command after wake word.
+    Whisper is ON here for best accuracy.
+    Returns list of command strings split on sentence-ending punctuation.
     """
     r = sr.Recognizer()
 
@@ -230,8 +393,11 @@ def capture_multi_commands(
         try:
             r.adjust_for_ambient_noise(source, duration=0.4)
             logger.info("Listening for command...")
+
             audio = r.listen(source, timeout=4, phrase_time_limit=phrase_limit)
-            text  = recognize_audio_chunk(r, audio, command_lang)
+
+            # use_whisper=True for command accuracy
+            text = recognize_audio_chunk(r, audio, command_lang, use_whisper=True)
 
             if not text:
                 return []
@@ -247,7 +413,7 @@ def capture_multi_commands(
 
 
 def get_voice_input(wake_word: str = "radhe") -> str:
-    """Convenience: wait for wake word then return first captured command."""
+    """Convenience: wake word → first captured command."""
     try:
         if listen_for_wake_word(wake_word=wake_word):
             cmds = capture_multi_commands()

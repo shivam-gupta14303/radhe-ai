@@ -240,3 +240,9 @@ class ReminderManager:
         if self.thread:
             self.thread.join(timeout=3)
         logger.info("ReminderManager stopped.")
+    
+    def set(self, task: str, time_str: str) -> bool:
+        return self.add_reminder(task, time_str)
+
+    def list_all(self) -> str:
+        return self.list_reminders()

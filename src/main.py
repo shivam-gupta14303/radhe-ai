@@ -2,9 +2,9 @@
 import logging
 import requests  # <-- for calling Ollama HTTP API
 
-from src.command_parser import parser
-from src.command_executor import executor
-from src.ai_knowledge import brain  # Radhe ka Brain (LLM + memory etc.)
+from command_parser import parser
+from command_executor import executor
+from ai_knowledge import brain  # Radhe ka Brain (LLM + memory etc.)
 
 # Configure logging
 logging.basicConfig(

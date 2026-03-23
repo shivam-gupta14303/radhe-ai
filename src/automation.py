@@ -138,6 +138,45 @@ class AutomationManager:
 
         results.sort(key=lambda f: f.stat().st_mtime, reverse=True)
         return [str(f) for f in results[:max_results]]
+    
+    # ===============================================================================
+    # RUN AUTOMATION
+    # ===============================================================================
+
+    def run(self, task: str) -> str:
+        task = (task or "").lower().strip()
+
+        # 📂 Recent files
+        if "recent" in task:
+            files = self.list_recent_files()
+            if not files:
+                return "No recent files found."
+            return "Recent files:\n" + "\n".join(files[:5])
+
+        # 🔍 File search
+        if any(k in task for k in ["find", "search", "dhundo", "khojo"]):
+            pattern = (
+                task.replace("find", "")
+                    .replace("search", "")
+                    .strip() or "*"
+            )
+
+            files = self.automate_file_search(pattern=pattern)
+
+            if not files:
+                return f"No files found matching '{pattern}'."
+
+            return "Found:\n" + "\n".join(files[:5])
+
+        # 📄 Open file
+        if "open" in task:
+            filename = task.replace("open", "").strip()
+            if not filename:
+                return "Please specify the file name to open."
+            return self.open_file(filename)
+
+        # ⚙️ Default fallback
+        return f"Running automation: {task}"
 
 
 # ── Global instance ───────────────────────────────────────────────────

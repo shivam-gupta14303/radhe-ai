@@ -1,0 +1,67 @@
+{
+  "default": {
+    "tool_preferences": {
+      "send_message": {
+        "whatsapp": 3
+      }
+    },
+    "contact_habits": {
+      "Message To": {
+        "call": 0,
+        "message": 1
+      },
+      "Amit Hello": {
+        "call": 0,
+        "message": 2
+      }
+    },
+    "time_habits": {
+      "open_app": {
+        "morning": 3
+      },
+      "send_message": {
+        "morning": 3
+      },
+      "system_control": {
+        "morning": 1
+      }
+    },
+    "outcome_log": [
+      {
+        "intent": "open_app",
+        "success": true,
+        "ts": "2026-03-22T09:46:05"
+      },
+      {
+        "intent": "send_message",
+        "success": true,
+        "ts": "2026-03-22T09:46:40"
+      },
+      {
+        "intent": "open_app",
+        "success": true,
+        "ts": "2026-03-22T10:54:23"
+      },
+      {
+        "intent": "send_message",
+        "success": true,
+        "ts": "2026-03-22T10:54:45"
+      },
+      {
+        "intent": "send_message",
+        "success": true,
+        "ts": "2026-03-22T10:54:56"
+      },
+      {
+        "intent": "open_app",
+        "success": true,
+        "ts": "2026-03-22T10:56:26"
+      },
+      {
+        "intent": "system_control",
+        "success": false,
+        "ts": "2026-03-22T11:13:42"
+      }
+    ]
+  }
+}

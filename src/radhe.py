@@ -1,4 +1,4 @@
-# src/interfaces/radhe.py
+#radhe.py
 """
 Radhe — Voice Interface Entry Point.
 
@@ -10,15 +10,15 @@ Updates vs previous version:
 
 import time
 import logging
+import llm_setup
 
-from src.command_parser import CommandParser
-from src.command_executor import executor
+from command_parser import CommandParser
+from command_executor import executor
 from speech import speak, listen_for_wake_word, capture_multi_commands
 from reminder_manager import ReminderManager
 from social_media import social_integrator
-
-# 🔥 LLM engine — attaches brain.llm_client (must run before any ai_knowledge call)
-import src.llm_setup  # noqa: F401
+from radhe_engine import RadheEngine
+engine = RadheEngine(user_id="default")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,37 +54,50 @@ def run():
 
     last_execution_time = 0.0
 
+    awaiting_reply = False   # add this before the while loop
+
     while True:
         try:
-
-            # Cooldown between commands
             if time.time() - last_execution_time < COOLDOWN:
                 time.sleep(0.2)
                 continue
 
-            # Wait for wake word
-            if not listen_for_wake_word(WAKE_WORD):
-                continue
+            # skip wake word if we're mid-clarification or mid-onboarding
+            if not awaiting_reply:
+                if not listen_for_wake_word(WAKE_WORD):
+                    continue
 
-            # Capture command
             cmds = capture_multi_commands()
             if not cmds:
                 speak("I didn't catch that. Please try again.")
+                awaiting_reply = False
                 continue
 
-            text = cmds[0].strip()
-            if not text:
-                continue
+            for text in cmds:
+                text = text.strip()
+                if not text:
+                    continue
 
-            logger.info("Command: %s", text)
+                logger.info("Command: %s", text)
 
-            # Parse → Execute → Speak
-            parsed = parser.parse(text)
-            result = executor.execute(parsed, text)
-
-            reply = result.get("voice") or result.get("text", "")
-            if reply:
-                speak(reply)
+                engine_result = engine.handle(text)
+                if engine_result and not engine_result.silent_skipped:
+                    action = engine_result.action
+                    if action.get("intent") == "clarify":
+                        reply          = action.get("entities", {}).get("question", "Thoda aur batao?")
+                        awaiting_reply = True
+                        speak(reply)
+                        break
+                    else:
+                        awaiting_reply = False
+                        reply = action.get("entities", {}).get("_output", "")
+                        if not reply:
+                            result = executor.execute(action, text)
+                            reply  = result.get("voice") or result.get("text", "")
+                        if not executor.context.get("onboarding_complete", True):
+                            awaiting_reply = True
+                        if reply:
+                            speak(reply)
 
             last_execution_time = time.time()
 
@@ -97,6 +110,7 @@ def run():
         except Exception as e:
             logger.exception("Voice loop error: %s", e)
             speak("Something went wrong. Please try again.")
+            awaiting_reply = False
             time.sleep(1)
 
 

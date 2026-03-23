@@ -174,3 +174,52 @@ def _apply_time_hint(
         return base.replace(hour=hour, minute=minute, second=0, microsecond=0)
     except Exception:
         return base
+
+
+def parse_time_smart(text: str) -> dict:
+    """
+    Hybrid parser:
+    1. Try structured parsing (command_parser style)
+    2. Try datetime parsing (this file)
+    3. Merge results
+
+    Returns:
+    {
+        "struct": dict | None,
+        "datetime": datetime | None,
+        "confidence": float
+    }
+    """
+
+    result = {
+        "struct": None,
+        "datetime": None,
+        "confidence": 0.0
+    }
+
+    # Try importing structured parser
+    try:
+        from command_parser import parse_time_struct, to_datetime
+
+        struct = parse_time_struct(text)
+        result["struct"] = struct
+
+        if struct:
+            dt = to_datetime(struct)
+            if dt:
+                result["datetime"] = dt
+                result["confidence"] = 0.9
+            else:
+                result["confidence"] = 0.6
+
+    except Exception:
+        pass
+
+    # Fallback to direct datetime parsing
+    if not result["datetime"]:
+        dt = parse_time(text)
+        if dt:
+            result["datetime"] = dt
+            result["confidence"] = max(result["confidence"], 0.7)
+
+    return result

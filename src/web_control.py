@@ -142,7 +142,16 @@ class WebController:
         if self.is_online():
             return "Yes, you're connected to the internet."
         return "No internet connection detected right now."
+    
+    # ==================================================================
+    # SEARCH AND OPEN URL
+    # ==================================================================
 
+    def search(self, query: str) -> str:
+        return self.google_search(query)
+    
+    def open_url(self, url: str) -> str:
+        return self.open_website(url)
 
 # GLOBAL INSTANCE
 web_controller = WebController()

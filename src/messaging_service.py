@@ -1,4 +1,4 @@
-# src/services/messaging_service.py
+# messaging_service.py
 """
 MessagingService for Radhe.
 
@@ -11,8 +11,14 @@ Fixes applied:
   unimplemented-but-planned platforms return clear "not yet" messages
 - get_status() added so executor can tell user if WhatsApp is connected
 
+NEW FIXES:
+- Direct WhatsAppManager integration (no dependency on social_integrator for sending)
+- Retry logic added for WhatsApp sending
+- Proper contact → phone resolution
+- Stable send() routing
+
 Usage:
-    from src.services.messaging_service import messaging_service
+    from services.messaging_service import messaging_service
     result = messaging_service.send("whatsapp", "Shivam", "Hello!")
     result = messaging_service.save_and_send("Shivam", "+919876543210", "Hello!", "whatsapp")
 """
@@ -21,7 +27,7 @@ import logging
 from typing import Optional
 
 from contact_manager import contact_manager
-from social_media    import social_integrator
+from social_media import social_integrator
 from whatsapp_manager import whatsapp_manager
 
 logger = logging.getLogger("Radhe_MessagingService")
@@ -40,15 +46,10 @@ class MessagingService:
     # ==================================================================
 
     def send(self, platform: str, contact_name: str, message: str) -> str:
-        """
-        Send a message to a contact on the given platform.
-        Returns a human-readable result string in all cases.
-        """
         platform     = (platform     or "whatsapp").lower().strip()
         contact_name = (contact_name or "").strip()
         message      = (message      or "").strip()
 
-        # ── Validate inputs ───────────────────────────────────────────
         if not message:
             return "The message is empty. Please tell me what to send."
 
@@ -61,24 +62,23 @@ class MessagingService:
                 f"Supported platforms: {', '.join(sorted(WORKING_PLATFORMS))}."
             )
 
-        # ── Check if platform is implemented ──────────────────────────
         if platform not in WORKING_PLATFORMS:
             return (
                 f"{platform.capitalize()} messaging is coming soon. "
                 f"For now I can send via WhatsApp."
             )
 
-        # ── Check WhatsApp session before contact lookup ──────────────
+        # WhatsApp session check
         if platform == "whatsapp":
-            session_ok = self._ensure_whatsapp_ready()
-            if not session_ok:
+            if not self._ensure_whatsapp_ready():
                 return (
                     "WhatsApp Web is not open. "
                     "Please say 'open WhatsApp' first, scan the QR code if needed, "
                     "then try sending the message again."
                 )
+            return self._send_whatsapp(contact_name, message)
 
-        # ── Look up contact ───────────────────────────────────────────
+        # Contact lookup
         contact = contact_manager.get_contact(contact_name)
 
         if not contact:
@@ -88,30 +88,64 @@ class MessagingService:
                 f"and I'll save it and send the message."
             )
 
-        # ── Route to platform ─────────────────────────────────────────
         return self._route(platform, contact_name, message)
 
     # ==================================================================
-    # SAVE AND SEND  (completes the awaiting_contact flow)
+    # ✅ NEW: WHATSAPP SEND HANDLER
+    # ==================================================================
+
+    def _send_whatsapp(self, contact: str, message: str) -> str:
+        phone = self._get_phone(contact)
+
+        if not phone:
+            return f"Contact '{contact}' not found. Please provide phone number."
+
+        # Ensure session is active
+        if not whatsapp_manager.driver:
+            whatsapp_manager.start()
+
+        # ✅ Retry logic (Problem 4 FIX)
+        for attempt in range(2):
+            ok = whatsapp_manager.send_message(phone, message)
+            if ok:
+                return f"Message sent to {contact}."
+
+        return f"Failed to send message to {contact}."
+    
+    def call(self, contact: str) -> str:
+        contact = (contact or "").strip()
+        if not contact:
+            return "No contact name provided."
+
+        # Resolve to phone number
+        phone = self._get_phone(contact)
+        if not phone:
+            return (
+                f"I don't have {contact}'s number saved. "
+                "Please provide their phone number first."
+            )
+
+        try:
+            import webbrowser
+            webbrowser.open(f"tel:{phone}")
+            return f"Calling {contact}."
+
+        except Exception as e:
+            logger.warning("Call failed: %s", e)
+            return f"Could not call {contact}. Please dial {phone} manually."
+
+    # ==================================================================
+    # SAVE AND SEND
     # ==================================================================
 
     def save_and_send(
         self,
         contact_name: str,
-        phone:        str,
-        message:      str,
-        platform:     str = "whatsapp"
+        phone: str,
+        message: str,
+        platform: str = "whatsapp"
     ) -> str:
-        """
-        Called when:
-        1. User tried to send a message but contact was not found.
-        2. Radhe asked for the phone number.
-        3. User provided the phone number.
 
-        This method saves the contact and immediately sends the message.
-        The executor should call this when context['awaiting_contact'] is set
-        and the user's next message looks like a phone number.
-        """
         contact_name = (contact_name or "").strip()
         phone        = (phone        or "").strip()
         message      = (message      or "").strip()
@@ -120,7 +154,6 @@ class MessagingService:
         if not contact_name or not phone or not message:
             return "Missing contact name, phone number, or message."
 
-        # Save the contact
         saved = contact_manager.add_contact(contact_name, phone, platform)
         if not saved:
             return (
@@ -130,26 +163,35 @@ class MessagingService:
 
         logger.info("Saved new contact: %s → %s", contact_name, phone)
 
-        # Now send
-        result = self._route(platform, contact_name, message)
+        # ✅ Use new send flow
+        result = self.send(platform, contact_name, message)
         return f"Saved {contact_name}'s number. {result}"
+
+    # ==================================================================
+    # ✅ NEW: CONTACT → PHONE RESOLUTION
+    # ==================================================================
+
+    def _get_phone(self, contact: str) -> Optional[str]:
+        data = contact_manager.get_contact(contact)
+        if not data:
+            return None
+
+        # handle both dict and direct string cases
+        if isinstance(data, dict):
+            return data.get("phone")
+
+        return data
 
     # ==================================================================
     # WHATSAPP SESSION CHECK
     # ==================================================================
 
     def _ensure_whatsapp_ready(self) -> bool:
-        """
-        Check if WhatsApp Web driver is already running and logged in.
-        Does NOT block waiting for QR — just returns False if not ready.
-        The user should say "open WhatsApp" to start the session explicitly.
-        """
         try:
             driver = whatsapp_manager.driver
             if driver is None:
                 return False
 
-            # Quick check: can we find the search bar (logged-in indicator)?
             from selenium.webdriver.common.by import By
             els = driver.find_elements(
                 By.XPATH,
@@ -162,11 +204,6 @@ class MessagingService:
             return False
 
     def start_whatsapp_session(self) -> str:
-        """
-        Explicitly start WhatsApp Web.
-        Call this when user says 'open WhatsApp'.
-        Returns a message to speak to the user.
-        """
         try:
             ok = whatsapp_manager.start()
             if ok:
@@ -180,7 +217,6 @@ class MessagingService:
             return "Could not open WhatsApp Web. Please open it manually."
 
     def get_status(self) -> str:
-        """Human-readable WhatsApp connection status."""
         if self._ensure_whatsapp_ready():
             return "WhatsApp Web is connected and ready."
         if whatsapp_manager.driver is not None:
@@ -192,9 +228,9 @@ class MessagingService:
     # ==================================================================
 
     def _route(self, platform: str, contact_name: str, message: str) -> str:
-        """Send via the appropriate platform handler."""
         try:
             if platform == "whatsapp":
+                # fallback (not used anymore, but kept for safety)
                 return social_integrator.send_whatsapp_by_contact(contact_name, message)
 
             elif platform == "telegram":

@@ -283,7 +283,39 @@ class VisionManager:
         except Exception as e:
             logger.exception("capture_screen_and_analyze failed: %s", e)
             return "I couldn't capture the screen."
+    
+    # ==================================================================
+    # SCREEN DESCRIPTION
+    # ==================================================================
+    def describe_screen(self) -> str:
+        return self.capture_screen_and_analyze()
+    
+    def read_text(self) -> str:
+        """Take a screenshot and run OCR on it."""
+        try:
+            import pyautogui
+            import tempfile
+            import os
 
+            screenshot = pyautogui.screenshot()
+
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                screenshot.save(tmp.name)
+                result = self.ocr_from_image(tmp.name)
+
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
+
+            return result if result else "No text found on screen."
+
+        except ImportError:
+            return "pyautogui not installed. Install it using pip install pyautogui"
+
+        except Exception as e:
+            logger.exception("read_text failed: %s", e)
+            return "Could not read text from screen."
 
 # ── Global instance ───────────────────────────────────────────────────
 vision_manager = VisionManager()

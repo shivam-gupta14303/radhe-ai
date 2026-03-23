@@ -7,6 +7,9 @@ Fixes applied:
 - Login detection now waits for the search bar (true logged-in state), not the QR canvas
 - Improved reliability with small sleeps after navigation
 
+New additions:
+- send_to_contact_name() → send message using saved contact name
+
 Future improvement ideas:
 - Use a proper incoming message watcher (MutationObserver via JS injection)
   instead of DOM scraping for more reliable message detection.
@@ -41,10 +44,7 @@ except Exception:
 
 PROFILE_DIR = os.path.join("data", "whatsapp_profile")
 
-# XPath for the WhatsApp Web search bar — only present when fully logged in
 _SEARCH_BAR_XPATH = "//div[@contenteditable='true' and @data-tab='3']"
-
-# XPath for the active message input box (bottom of an open chat)
 _MSG_INPUT_XPATH  = "//div[@contenteditable='true' and @data-tab='10']"
 
 
@@ -63,11 +63,6 @@ class WhatsAppManager:
     # ==================================================================
 
     def start(self) -> bool:
-        """
-        Open a persistent Chrome session with WhatsApp Web.
-        Blocks up to 90 seconds waiting for the user to scan the QR code.
-        If already logged in, returns in ~2 seconds.
-        """
         if not SELENIUM_AVAILABLE:
             raise RuntimeError(
                 "Selenium not available. "
@@ -83,7 +78,7 @@ class WhatsAppManager:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("detach", True)   # keep Chrome open after Python exits
+        opts.add_experimental_option("detach", True)
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
 
         service = Service(ChromeDriverManager().install())
@@ -92,7 +87,6 @@ class WhatsAppManager:
 
         logger.warning("WhatsApp Web opened — waiting for login (scan QR if needed)...")
 
-        # Wait up to 90 seconds for the SEARCH BAR (only visible when logged in)
         try:
             WebDriverWait(self.driver, 90).until(
                 EC.presence_of_element_located((By.XPATH, _SEARCH_BAR_XPATH))
@@ -107,7 +101,6 @@ class WhatsAppManager:
             return False
 
     def stop(self):
-        """Close the Chrome driver."""
         try:
             self._running = False
             if self.driver:
@@ -118,19 +111,11 @@ class WhatsAppManager:
             self.driver = None
 
     # ==================================================================
-    # SEND MESSAGE
+    # SEND MESSAGE (PHONE)
     # ==================================================================
 
     def send_message(self, phone: str, message: str) -> bool:
-        """
-        Send a WhatsApp message to a phone number (with country code, e.g. +919876543210).
 
-        Strategy:
-        1. Open the wa.me deep-link URL with the message pre-filled.
-        2. Wait for the message input box to appear.
-        3. Press ENTER only — the URL param already filled the text.
-           (Calling send_keys(message) here would type the message TWICE.)
-        """
         if not SELENIUM_AVAILABLE:
             logger.error("Selenium not installed.")
             return False
@@ -140,7 +125,6 @@ class WhatsAppManager:
             if not ok:
                 return False
 
-        # Normalise phone: remove spaces, dashes, leading '+'
         norm = (phone or "").strip().replace(" ", "").replace("-", "")
         if norm.startswith("+"):
             norm = norm[1:]
@@ -157,13 +141,14 @@ class WhatsAppManager:
             )
             self.driver.get(url)
 
-            # Wait for the message input to appear (chat has loaded)
+            # ✅ stability fix
+            time.sleep(1.5)
+
             try:
                 input_el = WebDriverWait(self.driver, 25).until(
                     EC.presence_of_element_located((By.XPATH, _MSG_INPUT_XPATH))
                 )
             except Exception:
-                # Fallback: try the generic contenteditable
                 try:
                     input_el = WebDriverWait(self.driver, 10).until(
                         EC.presence_of_element_located(
@@ -174,15 +159,11 @@ class WhatsAppManager:
                     logger.warning("Message input box not found for %s", phone)
                     return False
 
-            # Small pause so WhatsApp can finish filling the text from the URL param
             time.sleep(0.8)
 
-            # Press ENTER to send — do NOT call send_keys(message) here
-            # (the URL already filled the text; typing it again would duplicate it)
             input_el.click()
             input_el.send_keys(Keys.ENTER)
 
-            # Brief wait so the message actually sends before we navigate away
             time.sleep(1.0)
 
             logger.warning("Message sent to %s", phone)
@@ -193,14 +174,34 @@ class WhatsAppManager:
             return False
 
     # ==================================================================
+    # ✅ NEW: SEND USING CONTACT NAME
+    # ==================================================================
+
+    def send_to_contact_name(self, name: str, message: str) -> bool:
+        """
+        Send message using saved contact name.
+        Internally resolves phone and calls send_message().
+        """
+        try:
+            from contact_manager import contact_manager
+            contact = contact_manager.get_contact(name)
+            phone = contact.get("phone") if contact else None
+
+            if not phone:
+                logger.warning("Contact not found: %s", name)
+                return False
+
+            return self.send_message(phone, message)
+
+        except Exception as e:
+            logger.exception("send_to_contact_name failed: %s", e)
+            return False
+
+    # ==================================================================
     # INCOMING MESSAGE LISTENER
     # ==================================================================
 
     def _parse_incoming_messages(self) -> list:
-        """
-        Scrape the chat list for visible contact name + last message snippet.
-        Returns a list of (name, snippet) tuples.
-        """
         items = []
         if not self.driver:
             return items
@@ -218,7 +219,6 @@ class WhatsAppManager:
 
                     snippet = ""
                     try:
-                        # Try several common WhatsApp Web CSS class patterns
                         for cls in ["_21S-L", "_1wjpf", "_1ZMSm", "_2n_2q"]:
                             els = ch.find_elements(
                                 By.XPATH, f".//div[contains(@class,'{cls}')]"
@@ -239,14 +239,10 @@ class WhatsAppManager:
         return items
 
     def set_incoming_callback(self, cb: Callable[[str, str], None]):
-        """Register a callback: cb(contact_name, message_snippet)."""
         self._callback = cb
 
     def listen_incoming(self, poll_interval: float = 3.0):
-        """
-        Poll the WhatsApp Web chat list in a background thread.
-        Fires the registered callback for each new message snippet seen.
-        """
+
         if not SELENIUM_AVAILABLE:
             raise RuntimeError("Selenium not available.")
 

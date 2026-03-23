@@ -1,4 +1,4 @@
-# src/ai_knowledge.py
+# ai_knowledge.py
 """
 Radhe Intelligence Layer — single consolidated module.
 
@@ -19,9 +19,11 @@ import json
 import logging
 import os
 import random
-from typing import Optional, Callable, Dict, Any, List
-
 import wikipedia
+from typing import Optional, Callable, Dict, Any, List
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger("Radhe_AI")
 logger.setLevel(logging.INFO)
@@ -29,7 +31,27 @@ wikipedia.set_lang("en")
 
 DEFAULT_MEMORY_FILE = "radhe_memory.json"
 
+# ====================================================================
+# groq LLM client function (used by RadheBrain)
+# ====================================================================
 
+def groq_llm_client(prompt: str, meta: dict):
+    try:
+        client = Groq()
+
+        response = client.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=[
+                {"role": "system", "content": "You are a precise AI assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        logger.exception("Groq LLM error: %s", e)
+        return None
 # ======================================================================
 #  RadheMemory
 # ======================================================================
@@ -401,6 +423,7 @@ class AIKnowledgeFacade:
         language:    str = "en",
         last_intent: str = "",
         profile:     Optional[Dict] = None,
+        timeout:     int | None = None,
     ) -> str:
         q = (question or "").strip()
         if not q:
@@ -465,5 +488,8 @@ class AIKnowledgeFacade:
 # ======================================================================
 
 _memory      = RadheMemory()
-brain        = RadheBrain(memory=_memory)
+brain = RadheBrain(
+    llm_client=groq_llm_client,
+    memory=_memory
+)
 ai_knowledge = AIKnowledgeFacade(brain)
