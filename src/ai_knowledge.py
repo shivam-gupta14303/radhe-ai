@@ -22,6 +22,7 @@ import random
 import wikipedia
 from typing import Optional, Callable, Dict, Any, List
 from groq import Groq
+from config import RADHE_MEMORY_FILE
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -40,7 +41,7 @@ def groq_llm_client(prompt: str, meta: dict):
         client = Groq()
 
         response = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "You are a precise AI assistant."},
                 {"role": "user", "content": prompt}

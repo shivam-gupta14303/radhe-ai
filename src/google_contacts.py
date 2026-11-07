@@ -16,6 +16,7 @@ import os
 import logging
 import re
 from typing import List, Dict, Any
+from config import RADHE_MEMORY_FILE
 
 logger = logging.getLogger("Radhe_GoogleContacts")
 logger.setLevel(logging.WARNING)

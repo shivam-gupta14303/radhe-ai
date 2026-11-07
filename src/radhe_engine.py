@@ -27,6 +27,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
+from config import RADHE_MEMORY_FILE, DECISION_MEMORY_FILE, FAILURE_MEMORY_FILE
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
@@ -52,8 +53,8 @@ logger.setLevel(logging.INFO)
 _parser = CommandParser()
 
 # ── file paths ─────────────────────────────────────────────────────────
-_DM_FILE      = Path(__file__).parent / "decision_memory.json"
-_FAILURE_FILE = Path(__file__).parent / "failure_memory.json"
+_DM_FILE      = DECISION_MEMORY_FILE
+_FAILURE_FILE = FAILURE_MEMORY_FILE
 
 # ── agent loop limits ──────────────────────────────────────────────────
 MAX_AGENT_ITERATIONS = 3
@@ -1232,7 +1233,7 @@ class _MemoryBackend:
 
 
 class _LocalMemoryBackend(_MemoryBackend):
-    _FILE = Path(__file__).parent / "radhe_memory.json"
+    _FILE = RADHE_MEMORY_FILE
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}

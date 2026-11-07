@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from config import RADHE_MEMORY_FILE
 
 logger = logging.getLogger("Radhe.Parser")
 logger.setLevel(logging.INFO)
@@ -243,11 +244,45 @@ _rules("set_timer",       0.93,
 _rules("start_stopwatch", 0.90, r"\b(start stopwatch|stopwatch start|stopwatch chalu)\b")
 _rules("stop_stopwatch",  0.90, r"\b(stop stopwatch|stopwatch stop|stopwatch band)\b")
 
+# Reminders, Tasks & Calendar (Phase 4)
+_rules("get_daily_briefing", 0.98,
+    r"\b(?:good morning|shubh prabhat|morning briefing|daily briefing)\b",
+    r"\b(?:what is|show|give me|tell me)\s+(?:today.s|my)\s+(?:briefing|schedule|agenda|day)\b",
+    r"\baaj ka (?:schedule|plan|briefing|din) kya hai\b")
+
+_rules("create_calendar_event", 0.95,
+    r"\b(?:schedule|add to calendar|create event|book)\s+(?:a\s+)?(?:meeting|event|appointment|call)?\s*(?:with\s+(?P<with_whom>[\w\s]+?))?\s*(?:on|at|for)\s+(?P<time>.+)",
+    r"\b(?:calendar mein add karo|meeting schedule karo)\s+(?P<title>.+?)(?:\s+(?:at|on|ko)\s+(?P<time>.+))?$",
+    r"\b(?:calendar event|add event)\s+(?P<title>.+?)(?:\s+(?:at|on|for)\s+(?P<time>.+))?$")
+
+_rules("get_calendar_events", 0.94,
+    r"\b(?:what.s on my calendar|check calendar|show calendar|calendar events|show agenda|calendar schedule)\b",
+    r"\bcalendar\s+(?:check karo|dekho|dikhao)\b")
+
+_rules("add_task", 0.94,
+    r"\b(?:add task|add to todo|add to to-do|new task)\s+(?:to\s+)?(?P<title>.+)",
+    r"\b(?:task add karo|naya task)\s+(?P<title>.+)",
+    r"\b(?:add|put)\s+(?P<title>.+?)\s+(?:to|on)\s+my\s+(?:todo|tasks?|to-do)\s+list\b")
+
+_rules("list_tasks", 0.94,
+    r"\b(?:what are my tasks|show tasks|list tasks|show todo|show to-do|my tasks)\b",
+    r"\b(?:pending tasks|todo list|task list)\s*(?:dikhao|kya hai)?\b")
+
+_rules("complete_task", 0.94,
+    r"\b(?:complete task|mark task as done|finish task|done with task|completed task)\s+(?P<task>.+)",
+    r"\btask\s+(?P<task>.+?)\s+(?:complete|done|khatam)\s*(?:ho gaya|karo)?\b")
+
+_rules("delete_task", 0.94,
+    r"\b(?:delete task|remove task)\s+(?P<task>.+)",
+    r"\btask\s+(?P<task>.+?)\s+(?:delete|hata)\s*(?:do|karo)\b")
+
 # Reminders
 _rules("list_reminders",  0.90, r"\b(what reminders|show reminders|list reminders|my reminders|upcoming reminders|reminders dikhao)\b")
-_rules("cancel_reminder", 0.90,
-    r"\b(cancel|delete|remove|hatao)\s+(?:my\s+)?(?P<keyword>[\w\s]+?)\s+reminder\b",
-    r"\breminder cancel karo\s+(?P<keyword>[\w\s]+)")
+_rules("cancel_reminder", 0.92,
+    r"\b(?:cancel|delete|remove|hatao)\s+(?:my\s+)?(?:the\s+)?reminder\s+for\s+(?P<keyword>.+)",
+    r"\b(?:cancel|delete|remove|hatao)\s+(?:my\s+)?(?:the\s+)?reminder\s+about\s+(?P<keyword>.+)",
+    r"\b(?:cancel|delete|remove|hatao)\s+(?:my\s+)?(?P<keyword>[\w\s]+?)\s+reminder\b",
+    r"\breminder cancel karo\s*(?P<keyword>[\w\s]*)")
 _rules("set_reminder",    0.88,
     r"\b(remind me to|set a reminder to|reminder for)\s+(?P<reminder_text>.+?)\s+(?:at|on|in)\s+(?P<time>.+)",
     r"\bremind me in\s+(?P<time>.+?)\s+to\s+(?P<reminder_text>.+)",
@@ -266,14 +301,117 @@ _rules("call_contact",    0.93,
     r"^(?:call|ring)$")
 
 # Messaging
-_rules("send_message",    0.88,
-    r"\b(send|message|msg)\s+(?P<contact>[\w\s]+?)\s+(?:on|via)?\s*(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)?\s*(?:saying|that|:)?\s*(?P<message>.+)",
-    r"(?P<platform>whatsapp|telegram|instagram|sms|gmail)\s*(?:pe|par|ko)?\s*(?P<contact>[\w\s]+?)\s+ko\s+(?:bol|message|msg|bhej)\s+(?P<message>.+)",
-    r"\b(?P<contact>[A-Za-z]+(?:\s+[A-Za-z]+)?)\s+ko\s+(?:\w+\s+){0,2}?(?:message|msg|bhej|bol)\s+(?P<message>.+)",
-    r"\b(?P<contact>[A-Za-z][A-Za-z\s]{1,30}?)\s+ko\s+(?:message|msg|bhej|bol)\s+(?P<message>.+)",
-    r"\b(?:message|msg|bhej)\s+(?P<contact>[A-Za-z][A-Za-z\s]{1,30}?)\s+ko\b(?:\s+(?P<message>.+))?",
+# Personal Health Assistant (Phase 9)
+_rules("log_water_intake", 0.96,
+    r"\b(?:log|drank|had)\s+(?P<amount>\d+)\s*(?P<unit>ml|l|liters?|glasses?|glass)?\s*(?:of\s+)?water\b",
+    r"\b(?P<amount>\d+)\s*(?P<unit>ml|l|liters?|glass|glasses)?\s*paani\s+(?:piya|pi liya|log karo)\b",
+    r"\bpaani\s+piya\s+(?P<amount>\d+)\s*(?P<unit>ml|l|glass)?\b")
+
+_rules("get_water_intake", 0.95,
+    r"\b(?:how much water did i drink|what is my water intake|water status|check water)\b",
+    r"\baaj\s+(?:kitna\s+)?paani\s+piya\b")
+
+_rules("log_vital_sign", 0.95,
+    r"\blog\s+(?:my\s+)?(?:blood\s+pressure|bp)\s+(?P<systolic>\d+)\s*(?:over|/)\s*(?P<diastolic>\d+)\b",
+    r"\blog\s+(?:my\s+)?(?:glucose|sugar)\s+(?P<value>\d+)\b",
+    r"\blog\s+(?:my\s+)?(?:weight)\s+(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>kg|lbs)?\b")
+
+_rules("take_medication", 0.96,
+    r"\b(?:took|taken|le li)\s+(?:my\s+)?(?:medication|medicine|pill|dawa|dawai)\s*(?P<name>[A-Za-z0-9_-]+)?\b",
+    r"\b(?P<name>[A-Za-z0-9_-]+)\s+(?:dawai|medicine|pill)\s+le\s+li\b")
+
+_rules("list_medications", 0.95,
+    r"\b(?:what medicines do i have|list my medications|show medicines|my medications)\b",
+    r"\bmeri\s+(?:dawaiyan|medicines)\s*(?:dikhao|kya hain)?\b")
+
+# WhatsApp & Social Messaging (Phase 6)
+_rules("schedule_whatsapp_message", 0.96,
+    r"\b(?:schedule|bhejna)\s+(?:a\s+)?(?:whatsapp\s+)?message\s+(?:to\s+)?(?P<contact>[A-Za-z][\w\s]*?)\s+(?:at|on|for)\s+(?P<time>[^,\n]+?)\s+(?:saying|message|that|ki)\s+(?P<message>.+)",
+    r"\b(?P<contact>[A-Za-z][\w\s]*?)\s+ko\s+(?P<time>[^,\n]+?)\s+(?:whatsapp\s+)?message\s+(?:bhejna|karo)\s+(?:ki\s+)?(?P<message>.+)")
+
+_rules("list_scheduled_messages", 0.95,
+    r"\b(?:what messages are scheduled|show scheduled messages|list scheduled messages)\b",
+    r"\bscheduled messages\s*(?:dikhao|kya hai)?\b")
+
+_rules("cancel_scheduled_message", 0.95,
+    r"\b(?:cancel|delete)\s+scheduled\s+message\s*(?:to\s+(?P<keyword>.+))?\b")
+
+_rules("approve_reply", 0.97,
+    r"\b(?:yes send it|approve reply|send the reply|approve and send|haan bhej do|bhej do reply|approve kar do)\b")
+
+_rules("reject_reply", 0.97,
+    r"\b(?:no don.t send|reject reply|discard reply|mat bhejo|cancel reply|discard kar do)\b")
+
+_rules("send_message", 0.94,
+    r"\b(?:send|bhej)\s+(?:a\s+)?(?:(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)\s+)?(?:message|msg)\s+to\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"\b(?:send|bhej)\s+(?:a\s+)?(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)\s+to\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"\b(?:message|msg)\s+to\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)(?:\s+(?:on|via)?\s*(?P<platform>whatsapp|telegram|instagram|sms|email|gmail))?\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"\b(?P<platform>whatsapp)\s+(?:message\s+(?:to\s+)?)?(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"\b(?:send|bhej)\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+(?:a\s+)?(?:(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)\s+)?(?:message|msg)\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"\b(?:message|msg)\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+(?:on|via)\s+(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)\s+(?:saying|that|:)?\s*(?P<message>.+)",
+    r"(?P<platform>whatsapp|telegram|instagram|sms|gmail)\s*(?:pe|par|ko)?\s*(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+ko\s+(?:bol|message|msg|bhej|bhejo)\s+(?P<message>.+)",
+    r"\b(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+ko\s+(?:(?P<platform>whatsapp|telegram|instagram|sms|gmail)\s+(?:pe|par)\s+)?(?:message|msg|bhej|bol)\s+(?P<message>.+)",
+    r"\b(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)\s+ko\s+(?:bol|bhej|bhejo)\s+(?P<message>.+)",
+    r"\b(?:send|bhej)\s+(?:a\s+)?(?:(?P<platform>whatsapp|telegram|instagram|sms|email|gmail)\s+)?(?:message|msg)\s+to\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)$",
+    r"\b(?:message|msg)\s+to\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)$",
+    r"^(?:please\s+)?(?P<platform>whatsapp)\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+(?:\s+[A-Za-z0-9_\u0900-\u097F]+)?)$",
     r"\b(?:send|bhej)\s+(?:a\s+)?message\b",
     r"\bmessage\s+(?:karo|bhejo|bhejni hai|bhejdo)\b")
+
+_rules("read_messages", 0.96,
+    r"\b(?:read|check|show|get)\s+(?:my\s+)?(?:unread\s+)?(?:whatsapp\s+)?messages?\b",
+    r"\b(?:check|read|open)\s+(?:my\s+)?whatsapp\s+messages?\b",
+    r"\bread\s+(?:messages?|chats?)\s+from\s+(?P<contact>[A-Za-z0-9_\u0900-\u097F]+)\b",
+    r"\b(?:koi|kiska)\s+(?:naya\s+)?(?:whatsapp\s+)?message\s+(?:aaya|hai)\b",
+    r"\bwhatsapp\s+(?:messages?|check karo|padho|dekho)\b",
+    r"\bunread\s+messages?\b")
+
+_rules("set_whatsapp_mode", 0.96,
+    r"\b(?:set|change|switch)\s+(?:whatsapp\s+)?mode\s+(?:to\s+)?(?P<mode>monitor|approval|auto[\s\-_]?reply)\b",
+    r"\b(?:turn\s+on|enable|activate)\s+(?:whatsapp\s+)?(?P<mode>auto[\s\-_]?reply|approval|monitor)(?:\s+mode)?\b",
+    r"\b(?:turn\s+off|disable|deactivate)\s+(?:whatsapp\s+)?auto[\s\-_]?reply(?:\s+mode)?\b",
+    r"\bwhatsapp\s+mode\s+(?:to\s+)?(?P<mode>monitor|approval|auto[\s\-_]?reply)\b",
+    r"\bwhatsapp\s+(?:pe\s+)?(?P<mode>monitor|approval|auto[\s\-_]?reply)\s+mode(?:\s+(?:karo|on\s+karo|lagao))?\b",
+    r"\bwhatsapp\s+(?:auto[\s\-_]?reply|monitor|approval)\s+(?:on|karo|lagao)\b")
+
+_rules("get_whatsapp_mode", 0.96,
+    r"\b(?:what\s+is|check|show|get)\s+(?:the\s+)?whatsapp\s+mode\b",
+    r"\bwhatsapp\s+mode\s+(?:kya\s+hai|check\s+karo|status)\b")
+
+# AI Provider Selection & Management
+_rules("set_ai_provider", 0.98,
+    r"\b(?:switch|set|change|use)\s+(?:ai\s+)?(?:provider|model)?\s*(?:to\s+)?(?P<provider>openai|chatgpt|gpt|anthropic|claude|gemini|google|groq|ollama)\b",
+    r"\b(?:use|switch to|set to)\s+(?P<provider>openai|chatgpt|claude|gemini|groq|ollama)\b",
+    r"\b(?P<provider>openai|chatgpt|claude|gemini|groq|ollama)\s+(?:use karo|chalao|lagao)\b",
+    r"\b(?:switch to|use)\s+local\s+(?:ai|models?|ollama)\b")
+
+_rules("get_ai_provider", 0.98,
+    r"\b(?:what|which)\s+(?:ai\s+)?(?:provider|model)\s+(?:are you using|is active)\b",
+    r"\b(?:check|show|get)\s+(?:active\s+)?(?:ai\s+)?(?:provider|model|status)\b",
+    r"\bai\s+(?:provider|model)\s+(?:status|check|kya hai)\b")
+
+_rules("test_ai_connection", 0.98,
+    r"\b(?:test|check)\s+(?:ai\s+)?(?:connection|health|api)\b",
+    r"\bai\s+(?:connection|api)\s+test\s*(?:karo)?\b")
+
+# Memory Management & Recall
+_rules("recall_memory", 0.99,
+    r"\b(?:what do you remember|what do you know|recall|show memories|list memories)\s*(?:about\s+(?P<query>.+))?\b",
+    r"\b(?:kya yaad hai|meri memories|kya jante ho)\s*(?:mere bare mein|about\s+(?P<query>.+))?\b",
+    r"\b(?:what are my|show my|tell me my)\s+(?:preferences|memories|profile|saved facts)\b")
+
+_rules("remember_fact", 0.95,
+    r"(?<!what do you )(?<!do you )\b(?:remember|note down|save to memory|yad rakhna|yaad rakhna)\s+(?:that\s+)?(?P<fact>.+)",
+    r"\b(?:yad|yaad)\s+rakho\s+(?:ki\s+)?(?P<fact>.+)",
+    r"\bmera\s+(?P<fact>.+?)\s+(?:yaad|yad)\s+rakhna\b")
+
+_rules("forget_memory", 0.95,
+    r"\b(?:forget|delete memory|remove memory|bhul jao|bhula do)\s*(?:about\s+)?(?P<query>.+)?\b",
+    r"\b(?:clear|delete)\s+(?:all\s+)?memories\b")
+
+_rules("export_memory", 0.96,
+    r"\b(?:export|backup|download)\s+(?:my\s+)?(?:data|memories|profile|memory)\b",
+    r"\b(?:data|memories)\s+export\s*(?:karo)?\b")
 
 # Media
 _rules("youtube_search",  0.92,
@@ -413,6 +551,14 @@ def detect_intent(text: str) -> tuple[str, float, dict[str, Any]]:
                      + 0.02 * len(ents)
                      + 0.03 * (mlen / text_len)
                      - (0.05 if mlen < 4 else 0.0))
+            # Prevent false send_message when candidate contact contains bad contact tokens (e.g. "mode to")
+            if intent_id == "send_message":
+                c_test = (ents.get("contact") or "").lower()
+                if any(w in c_test.split() for w in ("mode", "settings", "setting", "monitor", "approval", "at", "for")):
+                    continue
+                if re.search(r"\b(?:schedule|scheduled)\b", text, re.IGNORECASE):
+                    continue
+
             if score > best_score:
                 best_score, best_intent, best_entities = score, intent_id, ents
 
@@ -422,6 +568,78 @@ def detect_intent(text: str) -> tuple[str, float, dict[str, Any]]:
     if best_intent == "change_mode":
         casual = {"normal", "casual", "informal", "normally", "casually"}
         best_entities["target_mode"] = "casual" if any(w in text for w in casual) else "formal"
+
+    if best_intent == "set_ai_provider":
+        p_val = best_entities.get("provider", "").lower()
+        if "chatgpt" in text.lower() or "gpt" in text.lower() or "openai" in text.lower():
+            p_val = "openai"
+        elif "claude" in text.lower() or "anthropic" in text.lower():
+            p_val = "anthropic"
+        elif "gemini" in text.lower() or "google" in text.lower():
+            p_val = "gemini"
+        elif "groq" in text.lower():
+            p_val = "groq"
+        elif "ollama" in text.lower() or "local" in text.lower():
+            p_val = "ollama"
+        best_entities["provider"] = p_val
+    if best_intent == "set_whatsapp_mode":
+        mode_val = best_entities.get("mode", "").lower()
+        if not mode_val:
+            if any(w in text.lower() for w in ("disable", "turn off", "deactivate", "stop")):
+                mode_val = "monitor"
+            elif any(w in text.lower() for w in ("auto reply", "autoreply", "auto_reply", "auto")):
+                mode_val = "auto_reply"
+            elif "approval" in text.lower() or "approve" in text.lower():
+                mode_val = "approval"
+            elif "monitor" in text.lower():
+                mode_val = "monitor"
+            else:
+                mode_val = "monitor"
+        else:
+            if "auto" in mode_val:
+                mode_val = "auto_reply"
+            elif "approv" in mode_val:
+                mode_val = "approval"
+            else:
+                mode_val = "monitor"
+        best_entities["mode"] = mode_val
+
+    if best_intent == "remember_fact":
+        f = best_entities.get("fact", "")
+        f = re.sub(r"^(?:that|ki)\s+", "", f, flags=re.I).strip()
+        best_entities["fact"] = f
+
+    if best_intent == "recall_memory":
+        q = best_entities.get("query", "")
+        q = re.sub(r"^(?:about|mere baare mein|mere bare mein)\s+", "", q, flags=re.I).strip()
+        best_entities["query"] = q
+
+    if best_intent == "add_task":
+        t = best_entities.get("title", "")
+        t = re.sub(r"^(?:that|to)\s+", "", t, flags=re.I).strip()
+        best_entities["title"] = t
+
+    if best_intent == "complete_task":
+        best_entities["task"] = best_entities.get("task", "").strip()
+
+    if best_intent == "delete_task":
+        best_entities["task"] = best_entities.get("task", "").strip()
+
+    if best_intent == "create_calendar_event":
+        w = best_entities.get("with_whom")
+        if w and not best_entities.get("title"):
+            best_entities["title"] = f"Meeting with {w.strip()}"
+        if not best_entities.get("title"):
+            best_entities["title"] = "Meeting"
+
+    if best_intent == "cancel_reminder":
+        kw = best_entities.get("keyword") or best_entities.get("alt_kw") or ""
+        best_entities["keyword"] = kw.strip()
+
+    if best_intent == "forget_memory":
+        q = best_entities.get("query", "")
+        q = re.sub(r"^(?:about|that|ki)\s+", "", q, flags=re.I).strip()
+        best_entities["query"] = q
 
     return best_intent, round(best_score, 4), best_entities
 
@@ -570,9 +788,11 @@ def _dedupe(names: list[str]) -> list[str]:
 
 _BAD_CONTACTS = {
     "mujhe", "use", "unhe", "hume", "tumhe", "aap", "usse", "vo", "woh",
-    "message", "msg", "call", "send", "bhej", "bol", "ring",
+    "message", "messages", "msg", "chats", "chat", "call", "send", "bhej", "bol", "ring",
     "karo", "karna", "lagao", "laga", "karein", "dijiye", "dena",
     "the", "a", "an", "my", "your", "his", "her",
+    "to", "on", "via", "ko", "par", "pe", "whatsapp", "telegram",
+    "instagram", "sms", "email", "gmail", "app", "saying", "that", "ki", "please", "mode", "settings", "setting", "monitor", "approval", "reply",
 }
 _NC = r"[A-Za-z]+(?:\s+[A-Za-z]+)?"
 
@@ -594,8 +814,11 @@ def extract_contact(text: str) -> list[str] | None:
     if singles: return singles
 
     # Tier 3
-    m = re.search(rf"\bto\s+({_NC})(?:\s+(?:on|via|pe|par)|$)", text, re.I)
-    if m: return [normalize_contact(m.group(1))]
+    m = re.search(rf"\bto\s+({_NC})\b", text, re.I)
+    if m:
+        c = normalize_contact(m.group(1))
+        if c.lower() not in _BAD_CONTACTS and len(c.strip()) > 1:
+            return [c]
 
     # Tier 4
     m = re.search(rf"\b(?:message|msg|call|ring|bhej|bol|send)\s+({_NC})\b", text, re.I)
@@ -696,6 +919,43 @@ def enrich_entities(intent: str, entities: dict[str, Any], text: str) -> dict[st
         if not entities.get("platform"):
             entities["platform"] = "whatsapp"
 
+        # Ensure contact is a single string AND contacts is a list
+        c_val = entities.get("contact")
+        if isinstance(c_val, list) and c_val:
+            entities["contacts"] = c_val
+            entities["contact"] = c_val[0]
+        elif isinstance(c_val, str) and c_val:
+            entities["contacts"] = [c_val]
+            entities["contact"] = c_val
+
+        # Fix multi-word contact bleed into message (e.g. 'Shivam Saying' -> 'Shivam', 'saying i will be late')
+        c_str = str(entities.get("contact") or "")
+        m_str = str(entities.get("message") or "")
+        _STOP = {"saying", "that", "i", "we", "he", "she", "you", "my", "hello", "hi", "a", "the", "please", "bol", "bhej"}
+        c_parts = c_str.split()
+        if len(c_parts) > 1 and c_parts[-1].lower() in _STOP:
+            shifted = c_parts[-1]
+            c_str = " ".join(c_parts[:-1])
+            entities["contact"] = c_str
+            entities["contacts"] = [c_str]
+            if m_str:
+                m_str = f"{shifted} {m_str}"
+            else:
+                m_str = shifted
+
+        if m_str:
+            m_str = re.sub(r"^(?:saying|that|:)\s*", "", m_str, flags=re.I).strip()
+            entities["message"] = m_str
+
+        # Clean any leading "to <name>" or "to " accidentally captured into message
+        msg_str = entities.get("message", "")
+        if isinstance(msg_str, str):
+            c_name = entities.get("contact", "")
+            if c_name and msg_str.lower().startswith(f"to {c_name.lower()}"):
+                entities["message"] = msg_str[len(f"to {c_name.lower()}"):].strip()
+            elif msg_str.lower().startswith("to "):
+                entities["message"] = msg_str[3:].strip()
+
     if intent == "call_contact":
         raw_c = entities.get("contact")
         if raw_c and isinstance(raw_c, str):
@@ -708,10 +968,27 @@ def enrich_entities(intent: str, entities: dict[str, Any], text: str) -> dict[st
         if not entities.get("contact"):
             c = extract_contact(clean_text)
             if c: entities["contact"] = c
+        c_val = entities.get("contact")
+        if isinstance(c_val, list) and c_val:
+            entities["contacts"] = c_val
+            entities["contact"] = c_val[0]
+        elif isinstance(c_val, str) and c_val:
+            entities["contacts"] = [c_val]
+            entities["contact"] = c_val
 
-    if intent in ("open_app", "close_app") and not entities.get("application"):
-        app = extract_application(clean_text)
-        if app: entities["application"] = app
+    if intent in ("open_app", "close_app"):
+        app = entities.get("application") or entities.get("app")
+        if not app:
+            app = extract_application(clean_text)
+        if app:
+            entities["application"] = app
+            entities["app"] = app
+
+    if intent == "open_website":
+        site = entities.get("website") or entities.get("url")
+        if site:
+            entities["website"] = site
+            entities["url"] = site
 
     if intent in ("search_web", "youtube_search", "play_music") and not entities.get("query"):
         q = extract_query(text)
@@ -1112,6 +1389,18 @@ class CommandParser:
         self, text: str, session: "SessionState"
     ) -> "ParsedAction | ClarificationRequest":
         """Single turn through the full state machine."""
+        clean_low = text.strip().lower()
+        if clean_low in ("cancel", "stop", "ruk", "nahi", "exit", "quit"):
+            session.reset()
+            return ParsedAction(intent="cancel", entities={}, confidence=1.0, raw=text, routing="execute")
+
+        # If user commands an entirely new action while awaiting slot/confirm
+        if session.state in _STATE_RESOLVES or session.state == ConvState.awaiting_confirm:
+            test_norm = normalize(text)
+            n_intent, n_conf, _ = detect_intent(test_norm)
+            if n_intent not in ("unknown", "ai_fallback", "greeting", "none") and n_conf >= 0.85:
+                session.reset()
+                session.state = ConvState.idle
 
         if session.state in _STATE_RESOLVES:
             completed = _apply_slot_reply(session, text)
@@ -1315,10 +1604,6 @@ def _apply_slot_reply(session: SessionState, raw_text: str) -> ParsedAction:
 
 HIGH_RISK_INTENTS: frozenset[str] = frozenset({
     "system_control",
-    "send_message",
-    "call_contact",
-    "cancel_reminder",
-    "close_app",
 })
 
 DESTRUCTIVE_INTENTS: frozenset[str] = frozenset({

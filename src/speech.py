@@ -12,8 +12,9 @@ Fixes vs previous version:
 
 import os
 import imageio_ffmpeg as ffmpeg
-os.environ["FFMPEG_BINARY"] = ffmpeg.get_ffmpeg_exe()
-os.environ["PATH"] += os.pathsep + os.path.dirname(ffmpeg.get_ffmpeg_exe())
+ffmpeg_path = ffmpeg.get_ffmpeg_exe()
+os.environ["FFMPEG_BINARY"] = ffmpeg_path
+os.environ["PATH"] = os.path.dirname(ffmpeg_path) + os.pathsep + os.environ.get("PATH", "")
 import re
 import json
 import logging
@@ -21,8 +22,7 @@ import queue
 import tempfile
 import threading
 import time
-from typing import List, Optional
-
+from typing import List, Optional, Callable
 import pyttsx3
 import speech_recognition as sr
 logger = logging.getLogger("Radhe_Speech")
@@ -34,7 +34,8 @@ ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID", "")
 
 # ── ElevenLabs client (optional) ─────────────────────────────────────
 _eleven_client = None
-if ELEVEN_API_KEY:
+USE_ELEVEN = False
+if USE_ELEVEN and ELEVEN_API_KEY:
     try:
         from elevenlabs.client import ElevenLabs
         from elevenlabs import play as eleven_play       
@@ -202,12 +203,18 @@ def _recognize_whisper(audio_data: sr.AudioData) -> str:
         return ""
     try:
         import tempfile
-        tmp_path = os.path.join(tempfile.gettempdir(), "radhe_audio.wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_data.get_wav_data())
+            tmp_path = tmp.name
 
         with open(tmp_path, "wb") as f:
             f.write(audio_data.get_wav_data())
 
-        result = _whisper_model.transcribe(tmp_path)
+        result = _whisper_model.transcribe(
+            tmp_path,
+            fp16=False,
+            verbose=False
+        )
 
         try:
             os.remove(tmp_path)
@@ -306,7 +313,7 @@ def recognize_audio_chunk(
     try:
         if use_whisper:
             text = _recognize_whisper(audio_data)
-            if text:
+            if text and len(text) > 2:
                 return text
 
         raw = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
@@ -316,7 +323,17 @@ def recognize_audio_chunk(
             if text:
                 return text.lower().strip()
 
-        return _recognize_google(recognizer, audio_data, language)
+        text = _recognize_google(recognizer, audio_data, language)
+        if text:
+            return text.lower().strip()
+
+        # Offline fallback: if Whisper is loaded, attempt Whisper when Vosk & Google fail
+        if not use_whisper and _whisper_model is not None:
+            text = _recognize_whisper(audio_data)
+            if text and len(text) > 2:
+                return text.lower().strip()
+
+        return ""
 
     except Exception as e:
         logger.warning("recognize_audio_chunk failed: %s", e)
@@ -324,18 +341,59 @@ def recognize_audio_chunk(
 
 
 # ======================================================================
-#  WAKE WORD  (Vosk/Google only — Whisper too slow for hot-word)
+#  WAKE WORD  (Vosk/Google only - Whisper too slow for hot-word)
 # ======================================================================
+
+def is_wake_word_match(text: str, wake_word: str = "radhe") -> bool:
+    """
+    Check if the transcribed audio text contains the wake word.
+    Supports English & Hindi phonetic variations of 'radhe' / 'hey radhe'.
+    """
+    if not text:
+        return False
+
+    cleaned = text.lower().strip()
+    target = wake_word.lower().strip()
+
+    # Hindi script direct check
+    if "राधे" in text or "राधा" in text:
+        return True
+
+    # If target is radhe/radha or hey radhe
+    if "radhe" in target or "radha" in target:
+        # Regex matching wake variations with word boundaries
+        # Matches: radhe, radha, radhey, raade, raadha, radhika, raddhe, etc.
+        # with optional greeting prefix like hey, hi, hello, ok, sun, suno, are, arre, oye
+        pattern = r"\b(?:hey|hi|hello|ok|sun|suno|are|arre|oye)?\s*(radhe|radha|radhey|raade|raadha|radhika|raddhe)\b"
+        if re.search(pattern, cleaned):
+            return True
+
+        if "radhe" in cleaned or "radha" in cleaned:
+            return True
+
+    # Generic wake word matching (for custom wake words)
+    target_clean = re.sub(r"[^\w\s]", "", target)
+    cleaned_no_punct = re.sub(r"[^\w\s]", "", cleaned)
+
+    if re.search(rf"\b{re.escape(target_clean)}\b", cleaned_no_punct):
+        return True
+
+    if " " in target_clean and target_clean in cleaned_no_punct:
+        return True
+
+    return False
+
 
 def listen_for_wake_word(
     wake_word:      str   = "radhe",
     wake_lang:      str   = "en",
     chunk_duration: float = 2.5,
+    stop_condition: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """
     Listen continuously until wake word detected.
-    Returns True on detection, False on KeyboardInterrupt only.
-    Whisper is OFF here — too slow for continuous wake-word polling.
+    Returns True on detection, False on KeyboardInterrupt or stop_condition.
+    Whisper is OFF here - Vosk/Google used for fast continuous polling.
     """
     r = sr.Recognizer()
 
@@ -344,13 +402,17 @@ def listen_for_wake_word(
         logger.info("Listening for wake word '%s'...", wake_word)
 
         while True:
+            if stop_condition and stop_condition():
+                logger.debug("Wake word listening aborted by stop_condition.")
+                return False
+
             try:
                 audio = r.listen(
                     source,
                     timeout          = chunk_duration,
                     phrase_time_limit= chunk_duration,
                 )
-                # use_whisper=False for speed
+                # use_whisper=False for fast wake-word polling
                 text = recognize_audio_chunk(r, audio, wake_lang, use_whisper=False)
 
                 if not text:
@@ -358,7 +420,7 @@ def listen_for_wake_word(
 
                 logger.debug("Heard: %s", text)
 
-                if wake_word.lower()[:3] in text.lower():
+                if is_wake_word_match(text, wake_word):
                     logger.info("Wake word detected: '%s'", text)
                     return True
 

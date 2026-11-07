@@ -18,6 +18,7 @@ import re
 import logging
 from collections import defaultdict
 from typing import List, Dict, Any, Optional
+from config import RADHE_MEMORY_FILE
 
 logger = logging.getLogger("Radhe_NLP")
 logger.setLevel(logging.INFO)

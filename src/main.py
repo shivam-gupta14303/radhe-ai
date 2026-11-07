@@ -1,70 +1,49 @@
-#main.py
+# main.py
+"""
+Text-based console entry point for Radhe AI.
+"""
+
 import logging
-import requests  # <-- for calling Ollama HTTP API
+import llm_setup  # Configures LLM (Groq / Ollama / Wikipedia fallback)
 
 from command_parser import parser
 from command_executor import executor
-from ai_knowledge import brain  # Radhe ka Brain (LLM + memory etc.)
+from ai_knowledge import brain
 
 # Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# -----------------------------
-# Connect Radhe's brain to Ollama (llama3.1)
-# -----------------------------
-
-def local_llm(prompt: str, meta: dict) -> str:
-    """
-    Connects Radhe's brain to the local Ollama llama3.1 model.
-    Ollama server must be running on http://localhost:11434
-    """
-    try:
-        resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3.1",   # text brain
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=120
-        )
-        data = resp.json()
-        return data.get("response", "").strip()
-    except Exception as e:
-        logging.error(f"local_llm error: {e}")
-        # Empty string will make ai_knowledge fall back to Wikipedia/unknown
-        return ""
-
-# Attach the brain to this LLM client
-brain.llm_client = local_llm
-
 
 def main():
-    """Main function to run the Radhe AI assistant"""
-    print("Radhe AI Assistant initialized. Say 'Radhe' to activate.")
-    print("(Type 'exit', 'quit' or 'stop' to close.)")
-    
+    """Main text loop to run the Radhe AI assistant"""
+    print("=" * 55)
+    print("   Radhe AI Assistant Initialized (Console Mode)")
+    print("   Type 'exit', 'quit' or 'stop' to close.")
+    print("=" * 55)
+
     while True:
         try:
-            # Get user input (this would be from voice in the real implementation)
-            user_input = input("You: ").strip()
-            
+            user_input = input("\nYou: ").strip()
+
+            if not user_input:
+                continue
+
             if user_input.lower() in ["exit", "quit", "stop"]:
                 print("Radhe: Goodbye! Have a great day!")
                 break
-                
-            # Parse the command (Brain-first if configured, otherwise regex)
+
+            # Parse command
             parsed_command = parser.parse(user_input)
-            
-            # Execute the command
+
+            # Execute command
             result = executor.execute(parsed_command, user_input)
-            
-            # Print the response
-            print(f"Radhe: {result['text']}")
-            
+
+            # Print response
+            print(f"Radhe: {result.get('text', '')}")
+
         except KeyboardInterrupt:
             print("\nRadhe: Goodbye! Have a great day!")
             break

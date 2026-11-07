@@ -6,10 +6,10 @@ import re
 import json
 import hashlib
 import threading
+
 from enum    import Enum
 from pathlib import Path
 from typing  import Dict, Any, Optional, List, Tuple, Set
-
 from system_control    import system_controller
 from web_control       import web_controller
 from utilities         import utility_manager
@@ -18,7 +18,9 @@ from memory            import MemoryManager
 from nlp               import nlp_manager
 from vision            import vision_manager
 from messaging_service import messaging_service
+from whatsapp_manager import whatsapp_manager
 from automation        import automation_manager
+from config            import RADHE_MEMORY_FILE
 
 logger = logging.getLogger("Radhe_Executor")
 
@@ -694,7 +696,7 @@ def _route_step(step: str, ctx: Dict, user_id: str, ai_fn: Any) -> str:
         message = state.get("message", step)
         if contact:
             return _normalize_tool_result(
-                messaging_service.send(contact=contact, message=message)
+                messaging_service.send(platform='whatsapp', contact_name=contact, message=message)
             ) or f"Message sent to {contact}."
 
     if any(k in n for k in ("call ", "make a call", "phone")):
@@ -1103,7 +1105,7 @@ class CommandExecutor:
             "interrupt":        False,
             "plan_state":       {},
             # IMP-5: onboarding state
-            "onboarding_complete": False,
+            "onboarding_complete": True,
             "onboarding_step":     0,
             "onboarding_data":     {},
             # IMP-6: session tracking
@@ -1514,7 +1516,7 @@ class CommandExecutor:
     def _resp(self, text: str) -> Dict[str, Any]:
         text = (text or "Something went wrong.").strip()
         self._log("assistant", text)
-        return {"text": text, "voice": text}
+        return {"text": text, "voice": text, "response": text, "success": True}
 
     def _lang(self, en: str, hi: str = "", mixed: str = "") -> str:
         lang = self.context.get("language", "en")
@@ -1666,6 +1668,71 @@ class CommandExecutor:
         ctx["last_intent"]  = intent
         ctx["last_command"] = text
 
+        # Check for explicit cancellation
+        clean_text_lower = text.strip().lower()
+        if intent in ("cancel", "cancelled", "stop") or clean_text_lower in (
+            "cancel", "stop", "nevermind", "ruk", "nahi", "exit", "quit", "chhod do", "mat bhejo", "cancel karo", "no", "don't send", "discard"
+        ):
+            ctx.pop("awaiting_message", None)
+            ctx.pop("awaiting_contact", None)
+            if ctx.pop("pending_whatsapp_approval", None):
+                ctx.pop("awaiting_whatsapp_approval", None)
+                return self._resp(self._lang(
+                    "Okay, discarded WhatsApp reply.",
+                    "Theek hai, WhatsApp reply cancel kar diya.",
+                    "Okay, WhatsApp reply discard kar diya.",
+                ))
+            return self._resp(self._lang(
+                "Okay, cancelled.",
+                "Theek hai, cancel kar diya.",
+                "Okay, cancel.",
+            ))
+
+        # Pending WhatsApp approval resolution
+        if ctx.get("pending_whatsapp_approval"):
+            pending = ctx.pop("pending_whatsapp_approval")
+            ctx.pop("awaiting_whatsapp_approval", None)
+            affirmative_words = (
+                "yes", "send", "send it", "bhej do", "bhejo", "haan", "ha", "kar do",
+                "karo", "confirm", "approve", "theek", "sure", "okay", "ok"
+            )
+            if any(w in clean_text_lower for w in affirmative_words) or intent in ("confirm", "send_message"):
+                sender = pending.get("sender", "")
+                reply = pending.get("reply", "")
+                res = messaging_service.send(platform="whatsapp", contact_name=sender, message=reply)
+                return self._resp(res)
+            else:
+                return self._resp(self._lang(
+                    "Okay, WhatsApp reply discarded.",
+                    "Theek hai, WhatsApp reply cancel kar diya.",
+                    "Okay, discarded.",
+                ))
+
+        # Resumption of pending slot turns
+        if ctx.get("awaiting_message"):
+            pending = ctx.pop("awaiting_message")
+            pending_contact = pending.get("contact", "")
+            return self._resp(messaging_service.send(platform="whatsapp", contact_name=pending_contact, message=text))
+
+        if ctx.get("awaiting_contact"):
+            pending = ctx.pop("awaiting_contact")
+            pending_intent = pending.get("pending_intent", "send_message")
+            pending_msg = pending.get("message", "")
+            pending_contact = text.strip()
+
+            if pending_intent == "send_message":
+                if pending_msg:
+                    return self._resp(messaging_service.send(platform="whatsapp", contact_name=pending_contact, message=pending_msg))
+                else:
+                    ctx["awaiting_message"] = {"pending_intent": "send_message", "contact": pending_contact}
+                    return self._resp(self._lang(
+                        f"What message would you like to send to {pending_contact}?",
+                        f"{pending_contact} ko kya message bhejun?",
+                        f"What should I say to {pending_contact}?",
+                    ))
+            elif pending_intent == "make_call":
+                return self._resp(messaging_service.call(contact=pending_contact))
+
         # IMP-2: Crisis check — always fires first, before any other routing.
         # Response is hardcoded — never LLM-generated.
         if _is_crisis(text):
@@ -1722,14 +1789,16 @@ class CommandExecutor:
             question = entities.get("question", "Thoda aur explain karein?")
             return self._resp(question)
 
-        if intent in ("cancelled", "none"):
+        if intent in ("cancel", "cancelled", "stop", "none"):
+            ctx.pop("awaiting_message", None)
+            ctx.pop("awaiting_contact", None)
             return self._resp(self._lang(
                 "Okay, cancelled.",
                 "Theek hai, cancel kar diya.",
                 "Okay, cancel.",
             ))
 
-        if intent == "greet":
+        if intent in ("greet", "greeting"):
             if not ctx.get("has_greeted"):
                 ctx["has_greeted"] = True
                 return self._resp(self._lang(
@@ -1747,16 +1816,25 @@ class CommandExecutor:
             return self._resp(self._ai_with_memory(text, ctx, user_id))
 
         if intent == "open_app":
-            app = entities.get("app", "")
+            app = (entities.get("application") or entities.get("app") or "").strip().lower()
+            if not app:
+                return self._resp(self._lang("No application specified.", "Application ka naam nahi bataya.", "No application specified."))
+            if app == "whatsapp":
+                return self._resp(messaging_service.start_whatsapp_session())
             return self._resp(_normalize_tool_result(system_controller.open_app(app))
                 or self._lang(f"Opening {app}.", f"{app} khol raha hoon.", f"Opening {app}."))
 
         if intent == "close_app":
-            app = entities.get("app", "")
+            app = (entities.get("application") or entities.get("app") or "").strip().lower()
+            if not app:
+                return self._resp(self._lang("No application specified.", "Application ka naam nahi bataya.", "No application specified."))
+            if app == "whatsapp":
+                whatsapp_manager.stop()
+                return self._resp(self._lang("Closed WhatsApp.", "WhatsApp band kar diya.", "Closed WhatsApp."))
             return self._resp(_normalize_tool_result(system_controller.close_app(app))
                 or self._lang(f"Closed {app}.", f"{app} band kar diya.", f"Closed {app}."))
 
-        if intent == "volume_control":
+        if intent in ("volume_control", "set_volume"):
             return self._resp(_normalize_tool_result(system_controller.set_volume(
                 level=entities.get("level"), action=entities.get("action", "")
             )) or self._lang("Volume adjusted.", "Volume set kar diya.", "Volume set kar diya."))
@@ -1774,13 +1852,13 @@ class CommandExecutor:
             return self._resp(_normalize_tool_result(system_controller.get_system_info())
                 or self._lang("Fetching system info.", "System info la raha hoon.", "System info la raha hoon."))
 
-        if intent == "web_search":
+        if intent in ("web_search", "search_web"):
             query = entities.get("query", text)
             return self._resp(_normalize_tool_result(web_controller.search(query))
                 or self._lang(f"Searching for {query}.", f"{query} search kar raha hoon.", f"Searching: {query}."))
 
         if intent == "open_website":
-            url = entities.get("url", "")
+            url = entities.get("website") or entities.get("url", "")
             return self._resp(_normalize_tool_result(web_controller.open_url(url))
                 or self._lang(f"Opening {url}.", f"{url} khol raha hoon.", f"Opening {url}."))
 
@@ -1793,12 +1871,210 @@ class CommandExecutor:
                     f"YouTube pe {query} search kar raha hoon.",
                 ))
 
+        if intent in ("read_messages", "check_messages"):
+            contact = entities.get("contact") or entities.get("contact_name") or ""
+            if isinstance(contact, list):
+                contact = contact[0] if contact else ""
+            contact = str(contact or "").strip()
+            if contact:
+                return self._resp(messaging_service.read_messages(contact))
+            return self._resp(messaging_service.get_unread_messages())
+
+        if intent == "remember_fact":
+            fact = entities.get("fact") or text
+            fact_clean = re.sub(r"^(?:remember\s+(?:that\s+)?|note\s+down\s+(?:that\s+)?|save\s+to\s+memory\s+|yad\s+rakhna\s+(?:ki\s+)?|yaad\s+rakhna\s+(?:ki\s+)?|yaad\s+rakho\s+(?:ki\s+)?|mera\s+)", "", str(fact), flags=re.I).strip()
+            if not fact_clean:
+                fact_clean = str(fact)
+            mem_id = self.memory.add_memory(text=fact_clean, user_id=user_id)
+            return self._resp(self._lang(
+                "Got it. I have saved that to my memory.",
+                "Theek hai, maine yaad rakh liya hai.",
+                f"Done, yaad rakh liya: {fact_clean}.",
+            ))
+
+        if intent == "recall_memory":
+            query = entities.get("query", "").strip()
+            if query:
+                results = self.memory.search_memories(query=query, user_id=user_id, limit=3)
+                if results:
+                    items = [r.get("text", "") for r in results]
+                    joined = "; ".join(items)
+                    return self._resp(self._lang(
+                        f"Here is what I remember about {query}: {joined}",
+                        f"{query} ke baare mein mujhe yeh yaad hai: {joined}",
+                        f"Found this about {query}: {joined}",
+                    ))
+                else:
+                    return self._resp(self._lang(
+                        f"I don't have any specific memories about {query}.",
+                        f"Mujhe {query} ke baare mein kuch yaad nahi hai.",
+                        f"No memories found for {query}.",
+                    ))
+            else:
+                summary = self.memory.get_memories_summary(user_id=user_id)
+                total = summary.get("total", 0)
+                by_type = summary.get("by_type", {})
+                types_str = ", ".join(f"{count} {t}" for t, count in by_type.items() if count > 0)
+                return self._resp(self._lang(
+                    f"I currently have {total} memories saved ({types_str or 'none'}).",
+                    f"Mere paas {total} yaadein saved hain ({types_str or 'kuch nahi'}).",
+                    f"You have {total} memories in Radhe ({types_str or 'empty'}).",
+                ))
+
+        if intent == "forget_memory":
+            query = entities.get("query", "").strip().lower()
+            if not query or "all" in query or "everything" in query or "sab" in query:
+                self.memory.clear_memories(user_id=user_id)
+                return self._resp(self._lang(
+                    "All memories have been cleared.",
+                    "Maine saari yaadein mita di hain.",
+                    "All memories cleared successfully.",
+                ))
+            else:
+                deleted = self.memory.delete(user_id, query)
+                if deleted:
+                    return self._resp(self._lang(
+                        f"Removed memory matching '{query}'.",
+                        f"'{query}' se judi memory hata di hai.",
+                        f"Deleted memory related to '{query}'.",
+                    ))
+                else:
+                    return self._resp(self._lang(
+                        f"No memory found matching '{query}'.",
+                        f"'{query}' se judi koi memory nahi mili.",
+                        f"Couldn't find any memory matching '{query}'.",
+                    ))
+
+        if intent == "export_memory":
+            fmt = entities.get("format", "json")
+            path = self.memory.export_data(user_id=user_id, format=fmt)
+            return self._resp(self._lang(
+                f"Your data has been exported successfully to {path}.",
+                f"Aapka data safalta-purvak export ho gaya hai: {path}.",
+                f"Exported your memories to {path}.",
+            ))
+
+        if intent == "log_water_intake":
+            from health_assistant import health_assistant
+            raw_amt = entities.get("amount", "250")
+            unit = entities.get("unit", "ml").lower()
+            try:
+                amt = float(raw_amt)
+                if "glass" in unit:
+                    amt *= 250.0
+                elif "l" in unit and unit != "ml":
+                    amt *= 1000.0
+            except Exception:
+                amt = 250.0
+            _, msg = health_assistant.log_water(amt, user_id=user_id)
+            return self._resp(msg)
+
+        if intent == "get_water_intake":
+            from health_assistant import health_assistant
+            total = health_assistant.get_daily_water_total(user_id=user_id)
+            return self._resp(f"You have consumed {int(total)}ml of water today out of your 2500ml goal.")
+
+        if intent == "log_vital_sign":
+            from health_assistant import health_assistant
+            if "systolic" in entities and "diastolic" in entities:
+                sys_v = float(entities["systolic"])
+                dia_v = float(entities["diastolic"])
+                health_assistant.log_vital("systolic", sys_v, unit="mmHg", user_id=user_id)
+                health_assistant.log_vital("diastolic", dia_v, unit="mmHg", user_id=user_id)
+                return self._resp(f"Logged blood pressure: {int(sys_v)}/{int(dia_v)} mmHg.")
+            metric = "glucose" if "glucose" in text.lower() or "sugar" in text.lower() else "weight"
+            val = float(entities.get("value", 0))
+            health_assistant.log_vital(metric, val, user_id=user_id)
+            return self._resp(f"Logged {metric}: {val}.")
+
+        if intent == "take_medication":
+            from health_assistant import health_assistant
+            med_name = entities.get("name") or "medication"
+            ok, msg = health_assistant.log_medication_taken(med_name, user_id=user_id)
+            return self._resp(msg)
+
+        if intent == "list_medications":
+            from health_assistant import health_assistant
+            meds = health_assistant.list_medications(active_only=True, user_id=user_id)
+            if not meds:
+                return self._resp("You have no active medications registered.")
+            lines = [f"• {m['name']} ({m['dosage']}) at {m['schedule_time']} [{m['remaining_doses']} doses left]" for m in meds]
+            return self._resp("Your active medications:\n" + "\n".join(lines))
+
+        if intent == "schedule_whatsapp_message":
+            contact = entities.get("contact", "").strip()
+            message = entities.get("message", "").strip()
+            time_str = entities.get("time", "").strip()
+            from social_media import social_integrator
+            res = social_integrator.schedule_whatsapp_message(contact, message, time_str)
+            return self._resp(res)
+
+        if intent == "list_scheduled_messages":
+            from social_media import social_integrator
+            return self._resp(social_integrator.list_scheduled_whatsapp())
+
+        if intent == "cancel_scheduled_message":
+            kw = entities.get("keyword") or text
+            from social_media import social_integrator
+            return self._resp(social_integrator.cancel_scheduled_whatsapp(kw))
+
+        if intent == "approve_reply":
+            from social_media import social_integrator
+            ok, msg = social_integrator.approve_pending_reply()
+            return self._resp(msg)
+
+        if intent == "reject_reply":
+            from social_media import social_integrator
+            return self._resp(social_integrator.reject_pending_reply())
+
+        if intent == "set_whatsapp_mode":
+            mode = entities.get("mode", "monitor")
+            from social_media import social_integrator
+            return self._resp(social_integrator.set_mode(mode))
+
+        if intent in ("get_whatsapp_mode", "check_whatsapp_mode"):
+            from social_media import social_integrator
+            return self._resp(f"WhatsApp mode is currently set to {social_integrator.get_mode()}.")
+
+        if intent == "set_ai_provider":
+            provider = entities.get("provider", "groq")
+            model = entities.get("model")
+            from ai_providers import ai_provider_manager
+            ok, msg = ai_provider_manager.set_active_provider(provider, model)
+            return self._resp(msg)
+
+        if intent == "get_ai_provider":
+            from ai_providers import ai_provider_manager
+            active_p = ai_provider_manager.get_active_provider_name().capitalize()
+            active_m = ai_provider_manager.get_active_model()
+            return self._resp(f"Radhe is currently powered by {active_p} (Model: {active_m}).")
+
+        if intent == "test_ai_connection":
+            from ai_providers import ai_provider_manager
+            active_p = ai_provider_manager.get_active_provider_name()
+            health = ai_provider_manager.test_provider(active_p)
+            status = health.get("status", "unknown")
+            msg = health.get("message", "")
+            lat = health.get("latency_ms", 0)
+            return self._resp(f"AI Provider Test ({active_p.capitalize()}): {status.upper()} - {msg} ({lat}ms).")
+
+        if intent == "set_whatsapp_mode":
+            mode = entities.get("mode", "monitor")
+            from social_media import social_integrator
+            return self._resp(social_integrator.set_mode(mode))
+
+        if intent in ("get_whatsapp_mode", "check_whatsapp_mode"):
+            from social_media import social_integrator
+            return self._resp(f"WhatsApp mode is currently set to {social_integrator.get_mode()}.")
+
         if intent == "send_message":
-            contact = entities.get("contact", "")
-            message = entities.get("message", "")
+            contact = entities.get("contact") or entities.get("contact_name") or ""
+            if isinstance(contact, list):
+                contact = contact[0] if contact else ""
+            contact = str(contact or "").strip()
+            message = str(entities.get("message") or "").strip()
+
             if not contact:
-                # BUG-3 FIX: store the full pending state so execute()
-                # can pick it up on the very next turn.
                 ctx["awaiting_contact"] = {
                     "pending_intent": "send_message",
                     "message": message,
@@ -1808,15 +2084,22 @@ class CommandExecutor:
                     "Kisko bhejun message?",
                     "Kisko bhejun? Tell me the name or number.",
                 ))
-            return self._resp(_normalize_tool_result(
-                messaging_service.send(platform="whatsapp", contact_name=contact, message=message)
-            ) or self._lang(
-                f"Message sent to {contact}.",
-                f"{contact} ko message bhej diya.",
-                f"Message sent to {contact}.",
-            ))
 
-        if intent == "make_call":
+            if not message:
+                ctx["awaiting_message"] = {
+                    "pending_intent": "send_message",
+                    "contact": contact,
+                }
+                return self._resp(self._lang(
+                    f"What message would you like to send to {contact}?",
+                    f"{contact} ko kya message bhejun?",
+                    f"What should I say to {contact}?",
+                ))
+
+            res = messaging_service.send(platform="whatsapp", contact_name=contact, message=message)
+            return self._resp(res)
+
+        if intent in ("make_call", "call_contact"):
             contact = entities.get("contact", "")
             if not contact:
                 ctx["awaiting_contact"] = {"pending_intent": "make_call"}
@@ -1832,28 +2115,125 @@ class CommandExecutor:
                     f"Calling {contact}.",
                 ))
 
+        # Reminders, Tasks, Calendar & Daily Briefing (Phase 4)
+        from reminder_manager import default_reminder_manager
+        rm = ctx.get("reminder_manager") or default_reminder_manager
+
         if intent == "set_reminder":
-            rm = ctx.get("reminder_manager")
-            if rm:
-                return self._resp(_normalize_tool_result(
-                    rm.set(entities.get("reminder", text), entities.get("time", ""))
-                ) or self._lang("Reminder set.", "Reminder laga diya.", "Reminder set ho gaya."))
-            return self._resp(self._lang(
-                "Reminder manager not available.",
-                "Reminder system available nahi hai.",
-                "Reminder system abhi available nahi hai.",
-            ))
+            r_text = entities.get("reminder_text") or entities.get("reminder") or text
+            r_time = entities.get("time") or ""
+            r_prio = entities.get("priority", "medium")
+            r_rec  = entities.get("recurrence", "none")
+            ok = rm.add_reminder(r_text, r_time, priority=r_prio, recurrence=r_rec)
+            if ok:
+                return self._resp(self._lang(
+                    f"Reminder set for {r_text}.",
+                    f"Theek hai, '{r_text}' ka reminder laga diya gaya hai.",
+                    f"Reminder set: {r_text}."
+                ))
+            else:
+                return self._resp(self._lang(
+                    "Could not understand the reminder time. Please specify when.",
+                    "Reminder ka samay samajh nahi aaya. Kripya samay batayein.",
+                    "Could not parse the time. Please tell me when."
+                ))
 
         if intent == "list_reminders":
-            rm = ctx.get("reminder_manager")
-            if rm:
-                return self._resp(_normalize_tool_result(rm.list_all())
-                    or self._lang("No reminders found.", "Koi reminder nahi mila.", "Koi reminder nahi mila."))
+            return self._resp(rm.list_reminders())
+
+        if intent == "cancel_reminder":
+            kw = entities.get("keyword") or text
+            return self._resp(rm.cancel_reminder(kw))
+
+        if intent == "add_task":
+            title = entities.get("title") or text
+            task_id = rm.add_task(title=title)
             return self._resp(self._lang(
-                "Reminder manager not available.",
-                "Reminder system available nahi hai.",
-                "Reminder system available nahi hai.",
+                f"Added '{title}' to your task list.",
+                f"'{title}' ko task list mein add kar diya gaya hai.",
+                f"Task added: '{title}'."
             ))
+
+        if intent == "list_tasks":
+            tasks = rm.list_tasks(status="pending")
+            if not tasks:
+                return self._resp(self._lang(
+                    "You have no pending tasks. Great job!",
+                    "Aapke paas koi pending task nahi hai.",
+                    "No pending tasks right now."
+                ))
+            items = [f"• {t['title']} ({t['priority']})" for t in tasks[:7]]
+            body = "\n".join(items)
+            return self._resp(self._lang(
+                f"Here are your pending tasks:\n{body}",
+                f"Aapke pending tasks yeh hain:\n{body}",
+                f"Your pending tasks:\n{body}"
+            ))
+
+        if intent == "complete_task":
+            target = entities.get("task") or text
+            ok = rm.complete_task(target)
+            if ok:
+                return self._resp(self._lang(
+                    f"Marked task '{target}' as completed.",
+                    f"Task '{target}' complete mark ho gaya hai.",
+                    f"Completed task '{target}'."
+                ))
+            else:
+                return self._resp(self._lang(
+                    f"Could not find an active task matching '{target}'.",
+                    f"'{target}' se milta koi active task nahi mila.",
+                    f"No pending task found matching '{target}'."
+                ))
+
+        if intent == "delete_task":
+            target = entities.get("task") or text
+            ok = rm.delete_task(target)
+            if ok:
+                return self._resp(self._lang(
+                    f"Deleted task '{target}'.",
+                    f"Task '{target}' delete kar diya hai.",
+                    f"Deleted task '{target}'."
+                ))
+            else:
+                return self._resp(self._lang(
+                    f"Could not find task matching '{target}'.",
+                    f"'{target}' se milta koi task nahi mila.",
+                    f"No task found matching '{target}'."
+                ))
+
+        if intent == "create_calendar_event":
+            from calendar_manager import calendar_manager
+            title = entities.get("title") or "Meeting"
+            time_val = entities.get("time") or ""
+            res = calendar_manager.create_event(title, time_val)
+            if res.get("success"):
+                ev = res["event"]
+                if res.get("conflicts"):
+                    c_title = res["conflicts"][0]["title"]
+                    return self._resp(self._lang(
+                        f"Event '{title}' added to your calendar, but note it conflicts with existing event '{c_title}'.",
+                        f"Event '{title}' schedule ho gaya, par dhyan dein yeh '{c_title}' se overlap kar raha hai.",
+                        f"Scheduled '{title}', warning: overlaps with '{c_title}'."
+                    ))
+                return self._resp(self._lang(
+                    f"Event '{title}' added to your calendar.",
+                    f"Event '{title}' aapke calendar mein schedule ho gaya hai.",
+                    f"Added event '{title}' to your calendar."
+                ))
+            else:
+                err = res.get("error", "Failed to create event")
+                return self._resp(self._lang(f"Could not schedule event: {err}", f"Event schedule nahi ho saka: {err}"))
+
+        if intent == "get_calendar_events":
+            from calendar_manager import calendar_manager
+            agenda = calendar_manager.format_agenda_text(lang=ctx.get("language", "en"))
+            return self._resp(agenda)
+
+        if intent == "get_daily_briefing":
+            from daily_briefing import daily_briefing_manager
+            briefing = daily_briefing_manager.generate_briefing(user_id=user_id, language=ctx.get("language", "en"))
+            return self._resp(briefing["spoken_text"])
 
         if intent == "get_time":
             return self._resp(_normalize_tool_result(utility_manager.get_time())

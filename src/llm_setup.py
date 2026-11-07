@@ -20,12 +20,13 @@ from typing import List, Dict, Any
 
 from dotenv import load_dotenv
 from ai_knowledge import brain
+from config import RADHE_MEMORY_FILE
 
 load_dotenv()
 
 logger        = logging.getLogger("Radhe_LLM")
 GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL    = "llama-3.1-70b-versatile"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 OLLAMA_MODEL  = "llama3.1"
 OLLAMA_URL    = "http://localhost:11434/api/generate"
 GROQ_URL      = "https://api.groq.com/openai/v1/chat/completions"
@@ -231,23 +232,27 @@ class LLMEngine:
 
     def generate(self, prompt: str, meta: dict) -> str:
         """
-        Main entry point.  Try Groq first, fall back to local Ollama.
-
-        `meta` should contain:
-            language  : "en" | "hi" | "mixed"
-            mode      : "neutral" | "casual" | "formal"
-            history   : list of {"role": str, "text": str} dicts
+        Main entry point for Radhe intelligence.
+        Delegates to AIProviderManager across OpenAI, Claude, Gemini, Groq, and Ollama.
         """
         if not isinstance(meta, dict):
             meta = {}
 
+        try:
+            from ai_providers import ai_provider_manager
+            response = ai_provider_manager.generate(prompt, meta)
+            if response:
+                return response
+        except Exception as e:
+            logger.error("AIProviderManager generation error: %s", e)
+
+        # Legacy fallback
         response = self.cloud_llm(prompt, meta)
         if response:
             return response
 
-        logger.info("Cloud LLM unavailable — falling back to local Ollama.")
+        logger.info("Cloud LLM unavailable - falling back to local Ollama.")
         return self.local_llm(prompt, meta)
-
 
 # ── Single global instance ────────────────────────────────────────────
 llm_engine = LLMEngine()
